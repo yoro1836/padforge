@@ -62,6 +62,10 @@ fn main() {
 
     // Find device, wait 1s, then create virtual device
     connect_device(&mut dev, cfg.vid, cfg.pid);
+    // epoll returns the opaque data stored at registration time.  Without
+    // setting it here, the initial device's events carry data=0 and never
+    // match dev.fd below (the reconnect path already did this correctly).
+    ep_dev.data = dev.fd as u64;
     unsafe { epoll_ctl(epfd, EPOLL_CTL_ADD, dev.fd, &mut ep_dev); }
     let mut have_dev = true;
 
