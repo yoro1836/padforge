@@ -108,7 +108,6 @@ the module config).
 | `pf.emit(type, code, value [, hold_ms])` | Emit an evdev event |
 | `pf.drop()` | Suppress the current event |
 | `pf.log(msg)` | Write to daemon log |
-| `pf.EV_KEY` / `pf.EV_ABS` | Event type constants |
 | `pf.version` | API version string |
 | `pf.raw_x` / `pf.raw_y` | Raw stick values before processing |
 
@@ -123,8 +122,8 @@ automatically. Supported kinds: `"toggle"`, `"permille"` (0-1000‰ with slider)
 module/            Installable AX Manager / KernelSU / Magisk module
   keyforge.sh      Control script and manager/runtime detection
   customize.sh     KernelSU/Magisk installer permissions and ABI check
-  service.sh       Late-start module entry point
-  uninstall.sh     Daemon and hidden-device cleanup
+  service.sh       Boot entry: daemon start plus detached request supervisor
+  uninstall.sh     Supervisor, daemon, and hidden-device cleanup
   webroot/         Built, fully offline WebUI assets
 webui/             Vue 3 + Vite WebUI source
   src/App.vue      Device, hiding, plugin, and daemon controls

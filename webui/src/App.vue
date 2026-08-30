@@ -153,9 +153,11 @@ async function refreshAll({ quiet = false } = {}) {
 async function daemonAction(action) {
   daemonBusy.value = true
   try {
-    const output = await runScript(action)
+    const output = await runScript('request', action)
     showMessage(output.split('\n')[0])
-    await new Promise((resolve) => setTimeout(resolve, 650))
+    // The supervisor applies the request within ~1s; give it time before
+    // refreshing the status badge.
+    await new Promise((resolve) => setTimeout(resolve, 1700))
     await Promise.all([checkStatus(), loadRuntime()])
   } catch (error) {
     showError(error)
@@ -261,7 +263,7 @@ async function togglePlugin(plugin, enabled) {
     await runScript('plugins', enabled ? 'enable' : 'disable', plugin.id)
     plugin.enabled = enabled
     showMessage(`${plugin.name} ${enabled ? 'enabled' : 'disabled'}`)
-    await new Promise((resolve) => setTimeout(resolve, 650))
+    await new Promise((resolve) => setTimeout(resolve, 1700))
     await Promise.all([checkStatus(), loadManifest()])
   } catch (error) {
     showError(error)
