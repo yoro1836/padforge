@@ -78,7 +78,17 @@ fn main() {
     }
     let lua = Lua::new();
     let mut pipeline = Pipeline::new();
-    let _ = plugin::load_plugins(&lua, &cfg.plugin_dir, &mut pipeline, &cfg.values);
+    // /sdcard (FUSE) may not be mounted yet when the daemon starts from
+    // service.sh; keep the pipeline empty and retry until the dir is readable.
+    let mut plugins_ready = fs::read_dir(&cfg.plugin_dir).is_ok();
+    if plugins_ready {
+        let _ = plugin::load_plugins(&lua, &cfg.plugin_dir, &mut pipeline, &cfg.values);
+    } else {
+        eprintln!(
+            "keyforge: plugin dir not reachable yet: {}; will retry",
+            cfg.plugin_dir
+        );
+    }
     let mut dev = Device::new(hidden_state_path);
     let ev_size = std::mem::size_of::<InputEvent>();
     let mut pending_releases: Vec<(Instant, EmitEvent)> = Vec::new();
@@ -162,6 +172,12 @@ fn main() {
             if settings_changed {
                 pipeline = Pipeline::new();
                 let _ = plugin::load_plugins(&lua, &fresh.plugin_dir, &mut pipeline, &fresh.values);
+                plugins_ready = fs::read_dir(&fresh.plugin_dir).is_ok();
+            } else if !plugins_ready && fs::read_dir(&fresh.plugin_dir).is_ok() {
+                eprintln!("keyforge: plugin dir became reachable; loading plugins");
+                pipeline = Pipeline::new();
+                let _ = plugin::load_plugins(&lua, &fresh.plugin_dir, &mut pipeline, &fresh.values);
+                plugins_ready = true;
             }
             if vid_changed && have_dev {
                 unsafe {
@@ -471,18 +487,20 @@ fn process_stick(
     pctx: &mut ProcCtx,
 ) {
     let mut e = Event::Stick { x, y, side };
-    let (emits, _) = pctx.pipeline.run(&mut e, pctx.values);
-    let mut se = *iev;
-    se.type_ = EV_ABS as u16;
-    se.code = code_x;
-    se.value = e.x();
-    unsafe {
-        write_ev(pctx.ufd, &se);
-    }
-    se.code = code_y;
-    se.value = e.y();
-    unsafe {
-        write_ev(pctx.ufd, &se);
+    let (emits, dropped) = pctx.pipeline.run(&mut e, pctx.values);
+    if !dropped {
+        let mut se = *iev;
+        se.type_ = EV_ABS as u16;
+        se.code = code_x;
+        se.value = e.x();
+        unsafe {
+            write_ev(pctx.ufd, &se);
+        }
+        se.code = code_y;
+        se.value = e.y();
+        unsafe {
+            write_ev(pctx.ufd, &se);
+        }
     }
     flush_emits(pctx, iev, &emits);
 }

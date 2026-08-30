@@ -163,3 +163,63 @@ fn st_get(table: &Table, key: &str) -> Option<String> {
         Value::String(s) => Some(s.to_str().ok()?.to_string()), Value::Integer(n) => Some(n.to_string()), Value::Number(n) => Some(n.to_string()), _ => None,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::Side;
+
+    const DEADZONE_PLUGIN: &str = r#"
+return {
+  id = "deadzone", name = "Deadzone Filter", version = "1.1.0", author = "keyforge",
+  settings = {
+    { key = "deadzone_left", label = "Left", kind = "permille", default = "91", min = 0, max = 1000 },
+  },
+  process = function(ev, cfg, pf)
+    if ev.kind ~= "stick" then return ev end
+    local dz = tonumber(cfg["deadzone_" .. ev.side]) or 0
+    local thr = 32767 * dz / 1000
+    local dist = math.sqrt(ev.x * ev.x + ev.y * ev.y)
+    if dist <= thr then
+      pf.drop()
+      pf.emit(pf.EV_ABS, 0, 0)
+      pf.emit(pf.EV_ABS, 1, 0)
+      return {}
+    end
+    return ev
+  end
+}"#;
+
+    #[test]
+    fn deadzone_plugin_transforms_stick_events() {
+        let dir = std::env::temp_dir().join(format!("keyforge-plugins-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("deadzone.lua"), DEADZONE_PLUGIN).unwrap();
+
+        let lua = Lua::new();
+        let mut pipeline = Pipeline::new();
+        let metas = load_plugins(&lua, dir.to_str().unwrap(), &mut pipeline, &HashMap::new());
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].id, "deadzone");
+        assert_eq!(pipeline.plugin_ids(), vec!["deadzone".to_string()]);
+
+        let mut settings = HashMap::new();
+        settings.insert("deadzone_left".to_string(), "500".to_string());
+        let mut event = Event::Stick { x: 100, y: 40, side: Side::Left };
+        let (emits, dropped) = pipeline.run(&mut event, &settings);
+        assert!(dropped);
+        assert_eq!(event.x(), 100);
+        assert_eq!(emits.len(), 2);
+        assert_eq!(emits[0].ev_type, 3);
+        assert_eq!(emits[0].value, 0);
+
+        let mut outside = Event::Stick { x: 30000, y: 0, side: Side::Left };
+        let (emits, dropped) = pipeline.run(&mut outside, &settings);
+        assert!(!dropped);
+        assert_eq!(emits.len(), 0);
+        assert_eq!(outside.x(), 30000);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

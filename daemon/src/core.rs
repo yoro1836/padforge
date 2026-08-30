@@ -21,6 +21,8 @@ unsafe extern "C" {
     pub fn epoll_wait(epfd: i32, events: *mut EpollEvent, maxevents: i32, timeout: i32) -> i32;
     pub fn inotify_init1(flags: i32) -> i32;
     pub fn inotify_add_watch(fd: i32, pathname: *const c_char, mask: u32) -> i32;
+    pub fn chown(path: *const c_char, owner: u32, group: u32) -> i32;
+    pub fn mknod(path: *const c_char, mode: u32, dev: u64) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +206,9 @@ struct HiddenDeviceState {
     ino: u64,
     rdev: u64,
     input_id: InputId,
+    mode: u32,
+    uid: u32,
+    gid: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,6 +258,8 @@ fn input_id_for_path(path: &Path) -> io::Result<Option<InputId>> {
     Ok(input_id)
 }
 
+const S_IFMT: u32 = 0o170000;
+
 impl HiddenDeviceState {
     fn capture(path: &Path, hidden_path: PathBuf, input_id: InputId) -> io::Result<Self> {
         let metadata = fs::metadata(path)?;
@@ -263,11 +270,14 @@ impl HiddenDeviceState {
             ino: metadata.ino(),
             rdev: metadata.rdev(),
             input_id,
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
         })
     }
 
-    fn matches(&self, metadata: &fs::Metadata) -> bool {
-        self.dev == metadata.dev() && self.ino == metadata.ino() && self.rdev == metadata.rdev()
+    fn same_device(&self, metadata: &fs::Metadata) -> bool {
+        self.dev == metadata.dev() && self.rdev == metadata.rdev()
     }
 
     fn save(&self, state_path: &Path) -> io::Result<()> {
@@ -279,9 +289,59 @@ impl HiddenDeviceState {
         fs::rename(temporary, state_path)
     }
 
+    fn mknod_node(&self, at: &Path, permissions: u32) -> io::Result<()> {
+        let cpath = CString::new(at.to_string_lossy().as_bytes())
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        if unsafe {
+            mknod(
+                cpath.as_ptr(),
+                (self.mode & S_IFMT) | permissions,
+                self.rdev,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn chown_node(&self, at: &Path) -> io::Result<()> {
+        let cpath = CString::new(at.to_string_lossy().as_bytes())
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        if unsafe { chown(cpath.as_ptr(), self.uid, self.gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Link the live node to the private name (hard link, or a fresh `mknod`
+    /// node with the same major/minor when the filesystem refuses links).
+    fn create_hidden_node(&self) -> io::Result<()> {
+        if fs::hard_link(&self.path, &self.hidden_path).is_ok() {
+            let _ = fs::set_permissions(
+                &self.hidden_path,
+                fs::Permissions::from_mode((self.mode & S_IFMT) | 0o600),
+            );
+            return Ok(());
+        }
+        self.mknod_node(&self.hidden_path, 0o600)
+    }
+
+    /// Recreate the original node from the private name, restoring its
+    /// original permissions and owner (critical when recreated via `mknod`).
+    fn restore_original_node(&self) -> io::Result<()> {
+        if fs::hard_link(&self.hidden_path, &self.path).is_ok() {
+            let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode & 0o7777));
+            self.chown_node(&self.path)?;
+            return Ok(());
+        }
+        self.mknod_node(&self.path, self.mode & 0o7777)?;
+        self.chown_node(&self.path)
+    }
+
     fn remove_hidden_link(&self) -> io::Result<()> {
         if let Some(metadata) = metadata_if_exists(&self.hidden_path)?
-            && self.matches(&metadata)
+            && self.same_device(&metadata)
         {
             fs::remove_file(&self.hidden_path)?;
         }
@@ -301,7 +361,7 @@ impl HiddenDeviceState {
         let Some(hidden_metadata) = metadata_if_exists(&self.hidden_path)? else {
             return Ok(false);
         };
-        if !self.matches(&hidden_metadata) {
+        if !self.same_device(&hidden_metadata) {
             return Ok(false);
         }
 
@@ -310,7 +370,7 @@ impl HiddenDeviceState {
             return Ok(false);
         }
 
-        fs::hard_link(&self.hidden_path, &self.path)?;
+        self.restore_original_node()?;
         if validate_input && input_id_for_path(&self.path)? != Some(self.input_id) {
             fs::remove_file(&self.path)?;
             self.remove_hidden_link()?;
@@ -474,7 +534,7 @@ impl Device {
         let input_id = input_id_for_fd(self.fd)?;
         let state = HiddenDeviceState::capture(&path, hidden_path, input_id)?;
         state.save(&state_path)?;
-        if let Err(error) = fs::hard_link(&state.path, &state.hidden_path) {
+        if let Err(error) = state.create_hidden_node() {
             let _ = fs::remove_file(&state_path);
             return Err(error);
         }
@@ -691,6 +751,27 @@ mod tests {
         assert_eq!(fs::metadata(&device).unwrap().mode() & 0o7777, 0o600);
         assert!(!hidden.exists());
         assert!(!state_path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mknod_fallback_recreates_a_node() {
+        let dir = test_dir("mknod-fallback");
+        let device = dir.join("event7");
+        fs::write(&device, b"device").unwrap();
+        let target = dir.join("recreated");
+        let state =
+            HiddenDeviceState::capture(&device, dir.join(".keyforge-event7"), InputId::default())
+                .unwrap();
+
+        state.mknod_node(&target, state.mode & 0o7777).unwrap();
+        let metadata = fs::metadata(&target).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, state.mode & 0o7777);
+        assert_eq!(metadata.mode() & S_IFMT, state.mode & S_IFMT);
+        assert_eq!(metadata.rdev(), state.rdev);
+
+        fs::remove_file(&target).unwrap();
+        fs::remove_file(&device).unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 
