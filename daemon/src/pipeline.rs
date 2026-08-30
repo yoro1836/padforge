@@ -111,6 +111,16 @@ impl Pipeline {
         self.steps.reverse();
     }
 
+    /// Reorder steps to follow `order` (ids first, in list order; unlisted
+    /// ids keep their relative order, appended after).
+    pub fn reorder(&mut self, order: &[String]) {
+        self.steps
+            .sort_by_key(|step| match order.iter().position(|id| id == step.id()) {
+                Some(index) => (index, String::new()),
+                None => (order.len(), step.id().to_string()),
+            });
+    }
+
     pub fn run(
         &self,
         event: &mut Event,

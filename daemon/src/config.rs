@@ -8,6 +8,7 @@ pub struct Config {
     pub pid: u16,
     pub plugin_dir: String,
     pub hide_device: bool,
+    pub plugin_order: Vec<String>,
     pub values: HashMap<String, String>,
 }
 
@@ -18,6 +19,7 @@ impl Config {
             pid: 0x028e,
             plugin_dir: "/sdcard/.keyforge/plugins".into(),
             hide_device: false,
+            plugin_order: Vec::new(),
             values: HashMap::new(),
         };
         if let Ok(file) = fs::File::open(path) {
@@ -34,6 +36,13 @@ impl Config {
                         "pid" => cfg.pid = parse_hex16(&val),
                         "plugin_dir" => cfg.plugin_dir = val,
                         "hide_device" => cfg.hide_device = parse_bool(&val),
+                        "plugin_order" => {
+                            cfg.plugin_order = val
+                                .split(',')
+                                .map(|item| item.trim().to_string())
+                                .filter(|item| !item.is_empty())
+                                .collect();
+                        }
                         _ => {
                             cfg.values.insert(key, val);
                         }
@@ -67,7 +76,7 @@ mod tests {
             std::env::temp_dir().join(format!("keyforge-config-{}.conf", std::process::id()));
         fs::write(
             &path,
-            "VID=0x054c\nPID=0x0ce6\nHIDE_DEVICE=on\nplugin.deadzone=1\n",
+            "VID=0x054c\nPID=0x0ce6\nHIDE_DEVICE=on\nplugin.deadzone=1\nPLUGIN_ORDER=square,deadzone\n",
         )
         .unwrap();
 
@@ -79,6 +88,8 @@ mod tests {
             config.values.get("plugin.deadzone").map(String::as_str),
             Some("1")
         );
+        assert_eq!(config.plugin_order, vec!["square", "deadzone"]);
+        assert!(!config.values.contains_key("plugin_order"));
         assert!(!config.values.contains_key("hide_device"));
         fs::remove_file(path).unwrap();
     }

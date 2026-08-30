@@ -186,6 +186,7 @@ pub fn load_plugins(
     plugin_dir: &str,
     pipeline: &mut Pipeline,
     config_values: &HashMap<String, String>,
+    order: &[String],
 ) -> Vec<PluginMeta> {
     let mut metas = Vec::new();
     let dir = match fs::read_dir(plugin_dir) {
@@ -195,7 +196,11 @@ pub fn load_plugins(
             return metas;
         }
     };
-    for entry in dir.flatten() {
+    // Filesystem order is arbitrary; load alphabetically so the baseline
+    // chain order is reproducible before applying the user's order.
+    let mut entries: Vec<_> = dir.flatten().collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("lua") {
             continue;
@@ -312,6 +317,13 @@ pub fn load_plugins(
         }
         metas.push(meta);
     }
+    // Apply the user's chain order (WebUI "plugin_order") on top of the
+    // alphabetical baseline so the manifest mirrors the actual pipeline.
+    pipeline.reorder(order);
+    metas.sort_by_key(|meta| match order.iter().position(|id| id == &meta.id) {
+        Some(index) => (index, String::new()),
+        None => (order.len(), meta.id.clone()),
+    });
     let m = Manifest {
         plugins: metas.clone(),
     };
@@ -372,7 +384,13 @@ return {
         let mut settings = HashMap::new();
         settings.insert("deadzone_left".to_string(), "500".to_string());
         let mut pipeline = Pipeline::new();
-        let metas = load_plugins(&lua, dir.to_str().unwrap(), &mut pipeline, &HashMap::new());
+        let metas = load_plugins(
+            &lua,
+            dir.to_str().unwrap(),
+            &mut pipeline,
+            &HashMap::new(),
+            &[],
+        );
         assert_eq!(metas.len(), 1);
         assert_eq!(metas[0].id, "deadzone");
         assert_eq!(pipeline.plugin_ids(), vec!["deadzone".to_string()]);
@@ -442,7 +460,7 @@ return {
 
         // replace → scale: scale must see the replaced values.
         let mut pipeline = Pipeline::new();
-        let metas = load_plugins(&lua, dir.to_str().unwrap(), &mut pipeline, &settings);
+        let metas = load_plugins(&lua, dir.to_str().unwrap(), &mut pipeline, &settings, &[]);
         pipeline.sort_steps_by_id();
         assert_eq!(
             pipeline.plugin_ids(),
@@ -461,7 +479,7 @@ return {
 
         // scale → replace: replacement wins.
         let mut reversed = Pipeline::new();
-        let _ = load_plugins(&lua, dir.to_str().unwrap(), &mut reversed, &settings);
+        let _ = load_plugins(&lua, dir.to_str().unwrap(), &mut reversed, &settings, &[]);
         reversed.sort_steps_by_id();
         reversed.reverse_steps();
         let (emits, dropped) = reversed.run(&mut event, &settings);
@@ -494,7 +512,13 @@ return {
 
         let lua = Lua::new();
         let mut pipeline = Pipeline::new();
-        let _ = load_plugins(&lua, dir.to_str().unwrap(), &mut pipeline, &HashMap::new());
+        let _ = load_plugins(
+            &lua,
+            dir.to_str().unwrap(),
+            &mut pipeline,
+            &HashMap::new(),
+            &[],
+        );
         let mut event = Event::Button {
             code: 304,
             pressed: true,
@@ -503,6 +527,57 @@ return {
         assert!(!dropped);
         assert!(emits.is_empty());
         assert_eq!((event.code(), event.pressed()), (311, true));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn load_order_follows_the_requested_sequence() {
+        let dir = std::env::temp_dir().join(format!("keyforge-order-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for id in ["deadzone", "square"] {
+            fs::write(
+                dir.join(format!("{id}.lua")),
+                format!(
+                    r#"return {{ id = "{id}", process = function(ev, cfg, pf) return ev end }}"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let lua = Lua::new();
+        let mut pipeline = Pipeline::new();
+        let metas = load_plugins(
+            &lua,
+            dir.to_str().unwrap(),
+            &mut pipeline,
+            &HashMap::new(),
+            &["square".to_string(), "deadzone".to_string()],
+        );
+        let order_ids: Vec<&str> = metas.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(order_ids, ["square", "deadzone"]);
+        assert_eq!(
+            pipeline.plugin_ids(),
+            ["square".to_string(), "deadzone".to_string()]
+        );
+
+        // Unlisted plugins fall back to the alphabetical baseline after the
+        // listed ones.
+        let mut baseline = Pipeline::new();
+        let baseline_metas = load_plugins(
+            &lua,
+            dir.to_str().unwrap(),
+            &mut baseline,
+            &HashMap::new(),
+            &[],
+        );
+        let baseline_ids: Vec<&str> = baseline_metas.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(baseline_ids, ["deadzone", "square"]);
+        assert_eq!(
+            baseline.plugin_ids(),
+            ["deadzone".to_string(), "square".to_string()]
+        );
 
         fs::remove_dir_all(dir).unwrap();
     }

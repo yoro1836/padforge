@@ -82,7 +82,13 @@ fn main() {
     // service.sh; keep the pipeline empty and retry until the dir is readable.
     let mut plugins_ready = fs::read_dir(&cfg.plugin_dir).is_ok();
     if plugins_ready {
-        let _ = plugin::load_plugins(&lua, &cfg.plugin_dir, &mut pipeline, &cfg.values);
+        let _ = plugin::load_plugins(
+            &lua,
+            &cfg.plugin_dir,
+            &mut pipeline,
+            &cfg.values,
+            &cfg.plugin_order,
+        );
     } else {
         eprintln!(
             "keyforge: plugin dir not reachable yet: {}; will retry",
@@ -167,16 +173,29 @@ fn main() {
             let fresh = Config::load(&config_path);
             let vid_changed = fresh.vid != cfg.vid || fresh.pid != cfg.pid;
             let hide_changed = fresh.hide_device != cfg.hide_device;
-            let settings_changed = fresh.values != cfg.values || fresh.plugin_dir != cfg.plugin_dir;
+            let settings_changed = fresh.values != cfg.values
+                || fresh.plugin_dir != cfg.plugin_dir
+                || fresh.plugin_order != cfg.plugin_order;
 
             if settings_changed {
                 pipeline = Pipeline::new();
-                let _ = plugin::load_plugins(&lua, &fresh.plugin_dir, &mut pipeline, &fresh.values);
+                let _ = plugin::load_plugins(
+                    &lua,
+                    &fresh.plugin_dir,
+                    &mut pipeline,
+                    &fresh.values,
+                    &fresh.plugin_order,
+                );
                 plugins_ready = fs::read_dir(&fresh.plugin_dir).is_ok();
             } else if !plugins_ready && fs::read_dir(&fresh.plugin_dir).is_ok() {
                 eprintln!("keyforge: plugin dir became reachable; loading plugins");
-                pipeline = Pipeline::new();
-                let _ = plugin::load_plugins(&lua, &fresh.plugin_dir, &mut pipeline, &fresh.values);
+                let _ = plugin::load_plugins(
+                    &lua,
+                    &fresh.plugin_dir,
+                    &mut pipeline,
+                    &fresh.values,
+                    &fresh.plugin_order,
+                );
                 plugins_ready = true;
             }
             if vid_changed && have_dev {

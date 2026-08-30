@@ -888,6 +888,34 @@
     gap: 13px;
   }
 
+  .order-buttons {
+    display: grid;
+    flex: 0 0 auto;
+    gap: 4px;
+  }
+
+  .order-button {
+    display: grid;
+    width: 26px;
+    height: 26px;
+    place-items: center;
+    border: 1px solid var(--md-sys-color-outline-variant);
+    border-radius: 8px 8px 8px 3px;
+    background: var(--md-sys-color-surface-container-high);
+    color: var(--md-sys-color-on-surface-variant);
+    cursor: pointer;
+    font-size: 0.68rem;
+    transition: border-radius var(--md-sys-duration-short) var(--md-sys-easing-emphasized);
+  }
+
+  .order-button:active {
+    border-radius: 4px 12px 12px 12px;
+  }
+
+  .order-button:disabled {
+    opacity: 0.3;
+  }
+
   .plugin-monogram {
     display: grid;
     flex: 0 0 auto;

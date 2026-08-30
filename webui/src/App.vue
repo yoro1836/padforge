@@ -270,6 +270,24 @@ async function togglePlugin(plugin, enabled) {
   }
 }
 
+async function movePlugin(index, delta) {
+  const target = index + delta
+  if (target < 0 || target >= plugins.value.length) return
+  const ids = plugins.value.map((plugin) => plugin.id)
+  ;[ids[index], ids[target]] = [ids[target], ids[index]]
+  try {
+    await runScript('config', 'set', 'plugin_order', ids.join(','))
+    plugins.value = ids
+      .map((id) => plugins.value.find((plugin) => plugin.id === id))
+      .filter(Boolean)
+    showMessage('Plugin order updated')
+    await new Promise((resolve) => setTimeout(resolve, 900))
+    await loadManifest()
+  } catch (error) {
+    showError(error)
+  }
+}
+
 async function uploadPlugin(event) {
   const input = event.target
   const file = input.files?.[0]
@@ -484,7 +502,7 @@ onBeforeUnmount(() => {
 
           <div v-if="plugins.length" class="plugin-stack">
             <section
-              v-for="plugin in plugins"
+              v-for="(plugin, index) in plugins"
               :key="plugin.id"
               class="plugin-card"
               :class="{ 'plugin-disabled': !plugin.enabled }"
@@ -497,6 +515,24 @@ onBeforeUnmount(() => {
                     <span>v{{ plugin.version }}</span>
                   </div>
                   <p>{{ plugin.description || `by ${plugin.author}` }}</p>
+                </div>
+                <div v-if="plugins.length > 1" class="order-buttons">
+                  <button
+                    class="order-button"
+                    :disabled="index === 0 || pluginBusy[plugin.id]"
+                    :aria-label="`Run ${plugin.name} earlier`"
+                    @click="movePlugin(index, -1)"
+                  >
+                    ↑
+                  </button>
+                  <button
+                    class="order-button"
+                    :disabled="index === plugins.length - 1 || pluginBusy[plugin.id]"
+                    :aria-label="`Run ${plugin.name} later`"
+                    @click="movePlugin(index, 1)"
+                  >
+                    ↓
+                  </button>
                 </div>
                 <label class="switch" :class="{ disabled: pluginBusy[plugin.id] }">
                   <input
