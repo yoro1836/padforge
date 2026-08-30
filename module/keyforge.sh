@@ -1,21 +1,107 @@
 #!/system/bin/sh
-# KeyForge – control script for WebUI and module management
+# KeyForge control script for WebUI and module management.
 
 MODDIR="${0%/*}"
 BIN="$MODDIR/keyforge"
 CONF="$MODDIR/keyforge.conf"
 PIDFILE="$MODDIR/keyforge.pid"
 LOG="$MODDIR/keyforge.log"
-MANIFEST="/sdcard/.keyforge/manifest.json"
-PLUGIN_DIR=/sdcard/.keyforge/plugins
+HIDDEN_STATE="$MODDIR/.hidden-device.json"
+DATA_DIR="/sdcard/.keyforge"
+MANIFEST="$DATA_DIR/manifest.json"
+PLUGIN_DIR="$DATA_DIR/plugins"
 
-log() { echo "[keyforge] $(date '+%H:%M:%S') $*" >> "$LOG"; }
+log() {
+    echo "[keyforge] $(date '+%H:%M:%S') $*" >> "$LOG"
+}
+
+detect_framework() {
+    if [ "${KSU:-}" = "true" ] || [ -x /data/adb/ksu/bin/busybox ]; then
+        echo "kernelsu"
+    elif [ -n "${MAGISK_VER_CODE:-}" ] || [ -x /data/adb/magisk/busybox ]; then
+        echo "magisk"
+    elif [ -d /data/user_de/0/com.android.shell/axeron ]; then
+        echo "axmanager"
+    else
+        echo "unknown"
+    fi
+}
+
+supports_device_hide() {
+    case "$(detect_framework)" in
+        kernelsu|magisk) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 is_running() {
     [ -f "$PIDFILE" ] || return 1
-    _pid=""; read -r _pid < "$PIDFILE" 2>/dev/null || return 1
-    [ -n "$_pid" ] && [ -d "/proc/$_pid" ] && return 0
-    rm -f "$PIDFILE"; return 1
+    _pid=""
+    read -r _pid < "$PIDFILE" 2>/dev/null || return 1
+    [ -n "$_pid" ] && [ -r "/proc/$_pid/cmdline" ] || {
+        rm -f "$PIDFILE"
+        return 1
+    }
+    _cmd="$(tr '\000' ' ' < "/proc/$_pid/cmdline" 2>/dev/null)"
+    case "$_cmd" in
+        *"$BIN"*) return 0 ;;
+    esac
+    rm -f "$PIDFILE"
+    return 1
+}
+
+valid_key() {
+    case "${1:-}" in
+        ""|*[!A-Za-z0-9._-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+config_get() {
+    _key="${1:-}"
+    valid_key "$_key" || return 2
+    [ -f "$CONF" ] || return 1
+    awk -v key="$_key" '
+        {
+            pos = index($0, "=")
+            if (pos > 0 && tolower(substr($0, 1, pos - 1)) == tolower(key)) {
+                print substr($0, pos + 1)
+                exit
+            }
+        }
+    ' "$CONF"
+}
+
+config_set() {
+    _key="${1:-}"
+    _value="${2:-}"
+    valid_key "$_key" || {
+        echo "keyforge: invalid configuration key" >&2
+        return 2
+    }
+    case "$_value" in
+        *"
+"*) echo "keyforge: configuration values must be one line" >&2; return 2 ;;
+    esac
+    ensure_conf
+    _tmp="$CONF.tmp.$$"
+    awk -v key="$_key" -v value="$_value" '
+        BEGIN { found = 0 }
+        {
+            pos = index($0, "=")
+            current = pos > 0 ? substr($0, 1, pos - 1) : ""
+            if (pos > 0 && tolower(current) == tolower(key)) {
+                if (!found) print key "=" value
+                found = 1
+            } else {
+                print
+            }
+        }
+        END { if (!found) print key "=" value }
+    ' "$CONF" > "$_tmp" && mv -f "$_tmp" "$CONF"
+    _result=$?
+    [ "$_result" -eq 0 ] || rm -f "$_tmp"
+    return "$_result"
 }
 
 ensure_conf() {
@@ -25,54 +111,175 @@ ensure_conf() {
 VID=0x045e
 PID=0x028e
 PLUGIN_DIR=/sdcard/.keyforge/plugins
+HIDE_DEVICE=0
 EOF
+    elif ! grep -qi '^HIDE_DEVICE=' "$CONF" 2>/dev/null; then
+        echo "HIDE_DEVICE=0" >> "$CONF"
     fi
+}
+
+restore_hidden_device() {
+    [ -x "$BIN" ] || return 0
+    [ -f "$HIDDEN_STATE" ] || return 0
+    "$BIN" --restore-hidden-state "$HIDDEN_STATE" >> "$LOG" 2>&1
+}
+
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g'
+}
+
+emit_device() {
+    [ -n "$_handler" ] && [ -n "$_name" ] || return 0
+    [ "$_name" = "KeyForge Virtual Controller" ] && return 0
+    [ "$_first" = "1" ] && _first=0 || printf ','
+    printf '{"name":"%s","vid":"%s","pid":"%s","handler":"%s"}' \
+        "$(json_escape "$_name")" "${_vid:-0x0000}" "${_pid:-0x0000}" \
+        "$(json_escape "$_handler")"
 }
 
 case "${1:-}" in
     start)
         ensure_conf
-        mkdir -p $MODDIR/plugins /sdcard/.keyforge/plugins /sdcard/.keyforge/configs 2>/dev/null
-        if is_running; then echo "keyforge: already running (pid $(cat "$PIDFILE"))"; exit 0; fi
-        if [ ! -f "$BIN" ]; then echo "keyforge: FATAL - binary not found: $BIN"; exit 1; fi
-        chmod 755 "$BIN" 2>/dev/null || true
-        log "starting daemon"
-        nohup "$BIN" --config "$CONF" >> "$LOG" 2>&1 &
-        _bpid=$!; echo "$_bpid" > "$PIDFILE"
+        mkdir -p "$MODDIR/plugins" "$PLUGIN_DIR" "$DATA_DIR/configs" 2>/dev/null
+        if is_running; then
+            echo "keyforge: already running (pid $(cat "$PIDFILE"))"
+            exit 0
+        fi
+        if [ ! -f "$BIN" ]; then
+            echo "keyforge: FATAL - binary not found: $BIN"
+            exit 1
+        fi
+        chmod 755 "$BIN" 2>/dev/null || :
+        restore_hidden_device
+        log "starting daemon on $(detect_framework)"
+        if supports_device_hide; then
+            nohup "$BIN" --config "$CONF" --hidden-state "$HIDDEN_STATE" \
+                --allow-device-hide >> "$LOG" 2>&1 &
+        else
+            nohup "$BIN" --config "$CONF" --hidden-state "$HIDDEN_STATE" \
+                >> "$LOG" 2>&1 &
+        fi
+        _bpid=$!
+        echo "$_bpid" > "$PIDFILE"
         sleep 0.3
         if [ -d "/proc/$_bpid" ]; then
-            log "started (pid=$_bpid)"; echo "keyforge: started (pid=$_bpid)"
+            log "started (pid=$_bpid)"
+            echo "keyforge: started (pid=$_bpid)"
         else
-            rm -f "$PIDFILE"; log "died"; echo "keyforge: FAILED - see $LOG"; exit 1
+            rm -f "$PIDFILE"
+            restore_hidden_device
+            log "died"
+            echo "keyforge: FAILED - see $LOG"
+            exit 1
         fi
         ;;
 
     stop)
         if is_running; then
-            _pid=""; read -r _pid < "$PIDFILE" 2>/dev/null
-            log "stopping (pid=$_pid)"; kill "$_pid" 2>/dev/null || true
-            sleep 0.3; kill -9 "$_pid" 2>/dev/null || true
-            rm -f "$PIDFILE"; echo "keyforge: stopped"
-        else echo "keyforge: not running"; fi
+            _pid=""
+            read -r _pid < "$PIDFILE" 2>/dev/null
+            log "stopping (pid=$_pid)"
+            kill "$_pid" 2>/dev/null || :
+            _wait=0
+            while [ -d "/proc/$_pid" ] && [ "$_wait" -lt 20 ]; do
+                sleep 0.1
+                _wait=$((_wait + 1))
+            done
+            [ -d "/proc/$_pid" ] && kill -9 "$_pid" 2>/dev/null || :
+            rm -f "$PIDFILE"
+            restore_hidden_device
+            echo "keyforge: stopped"
+        else
+            restore_hidden_device
+            echo "keyforge: not running"
+        fi
         ;;
 
-    restart) "$0" stop; sleep 0.5; "$0" start ;;
+    restart)
+        "$0" stop
+        sleep 0.5
+        "$0" start
+        ;;
 
     status)
-        if is_running; then echo "running pid=$(cat "$PIDFILE")"
-        else echo "stopped"; fi
+        if is_running; then
+            echo "running pid=$(cat "$PIDFILE")"
+        else
+            echo "stopped"
+        fi
+        ;;
+
+    runtime)
+        ensure_conf
+        _framework="$(detect_framework)"
+        _supported=false
+        supports_device_hide && _supported=true
+        _enabled=false
+        [ "$(config_get HIDE_DEVICE)" = "1" ] && _enabled=true
+        _active=false
+        [ -f "$HIDDEN_STATE" ] && _active=true
+        printf '{"framework":"%s","deviceHideSupported":%s,"deviceHideEnabled":%s,"deviceHideActive":%s}\n' \
+            "$_framework" "$_supported" "$_enabled" "$_active"
+        ;;
+
+    hide)
+        ensure_conf
+        case "${2:-status}" in
+            on)
+                if ! supports_device_hide; then
+                    echo "keyforge: device hiding requires KernelSU or Magisk" >&2
+                    exit 2
+                fi
+                config_set HIDE_DEVICE 1 || exit $?
+                echo "keyforge: physical device hiding enabled"
+                ;;
+            off)
+                config_set HIDE_DEVICE 0 || exit $?
+                is_running || restore_hidden_device
+                echo "keyforge: physical device hiding disabled"
+                ;;
+            status)
+                printf 'framework=%s supported=%s enabled=%s\n' \
+                    "$(detect_framework)" \
+                    "$(supports_device_hide && echo 1 || echo 0)" \
+                    "$([ "$(config_get HIDE_DEVICE)" = "1" ] && echo 1 || echo 0)"
+                ;;
+            *) echo "usage: keyforge.sh hide {on|off|status}" >&2; exit 2 ;;
+        esac
         ;;
 
     manifest)
-        if [ -f "$MANIFEST" ]; then cat "$MANIFEST"; else echo '{"plugins":[]}'; fi
+        if [ -f "$MANIFEST" ]; then
+            cat "$MANIFEST"
+        else
+            echo '{"plugins":[]}'
+        fi
         ;;
 
     config)
         ensure_conf
         case "${2:-}" in
-            batch) shift 2; for _pair in "$@"; do _key="${_pair%%=*}"; _value="${_pair#*=}"; if grep -q "^${_key}=" "$CONF" 2>/dev/null; then sed -i "s/^${_key}=.*/${_key}=${_value}/" "$CONF"; else echo "${_key}=${_value}" >> "$CONF"; fi; done; echo "keyforge: batch saved ${#} keys" ;;
-            get) [ -n "${3:-}" ] && grep "^${3}=" "$CONF" 2>/dev/null | cut -d= -f2 || cat "$CONF" 2>/dev/null ;;
-            set) _key="$3"; _value="$4"; if grep -q "^${_key}=" "$CONF" 2>/dev/null; then sed -i "s/^${_key}=.*/${_key}=${_value}/" "$CONF"; else echo "${_key}=${_value}" >> "$CONF"; fi; echo "keyforge: $_key = $_value" ;;
+            batch)
+                shift 2
+                _count=$#
+                for _pair in "$@"; do
+                    _key="${_pair%%=*}"
+                    _value="${_pair#*=}"
+                    config_set "$_key" "$_value" || exit $?
+                done
+                echo "keyforge: batch saved $_count keys"
+                ;;
+            get)
+                [ -n "${3:-}" ] && config_get "$3" || cat "$CONF" 2>/dev/null
+                ;;
+            set)
+                [ "$#" -ge 4 ] || {
+                    echo "usage: keyforge.sh config set KEY VALUE" >&2
+                    exit 2
+                }
+                config_set "$3" "$4" || exit $?
+                echo "keyforge: $3 = $4"
+                ;;
             *) cat "$CONF" 2>/dev/null ;;
         esac
         ;;
@@ -80,41 +287,169 @@ case "${1:-}" in
     devices)
         printf '{"devices":['
         _first=1
-        getevent -i 2>/dev/null > /tmp/kf_devices.tmp
-        _name=""; _vid=""; _pid=""; _handler=""
+        _tmp="/tmp/kf_devices.$$"
+        if [ -x /system/bin/getevent ]; then
+            /system/bin/getevent -i 2>/dev/null > "$_tmp"
+        else
+            getevent -i 2>/dev/null > "$_tmp"
+        fi
+        _name=""
+        _vid=""
+        _pid=""
+        _handler=""
         while IFS= read -r line; do
             case "$line" in
-                "add device"*) [ -n "$_handler" ] && [ -n "$_name" ] && { [ "$_first" = "1" ] && _first=0 || printf ','; printf '{"name":"%s","vid":"%s","pid":"%s","handler":"%s"}' "$_name" "${_vid:-0x0000}" "${_pid:-0x0000}" "$_handler"; }; _handler="${line##* }"; _handler="${_handler##*/}"; _name=""; _vid=""; _pid="" ;;
-                *name:*) _name="${line#*\"}"; _name="${_name%\"*}" ;;
-                *vendor*) _vid="${line##* }"; case "$_vid" in 0x*) ;; *) _vid="0x${_vid}" ;; esac ;;
-                *product*) _pid="${line##* }"; case "$_pid" in 0x*) ;; *) _pid="0x${_pid}" ;; esac ;;
+                "add device"*)
+                    emit_device
+                    _handler="${line##* }"
+                    _handler="${_handler##*/}"
+                    _name=""
+                    _vid=""
+                    _pid=""
+                    ;;
+                *name:*)
+                    _name="${line#*\"}"
+                    _name="${_name%\"*}"
+                    ;;
+                *vendor*)
+                    _vid="${line##* }"
+                    case "$_vid" in 0x*) ;; *) _vid="0x${_vid}" ;; esac
+                    ;;
+                *product*)
+                    _pid="${line##* }"
+                    case "$_pid" in 0x*) ;; *) _pid="0x${_pid}" ;; esac
+                    ;;
             esac
-        done < /tmp/kf_devices.tmp
-        [ -n "$_handler" ] && [ -n "$_name" ] && { [ "$_first" = "1" ] && _first=0 || printf ','; printf '{"name":"%s","vid":"%s","pid":"%s","handler":"%s"}' "$_name" "${_vid:-0x0000}" "${_pid:-0x0000}" "$_handler"; }
-        rm -f /tmp/kf_devices.tmp
+        done < "$_tmp"
+        emit_device
+        rm -f "$_tmp"
         printf ']}\n'
         ;;
 
     plugins)
         mkdir -p "$PLUGIN_DIR" 2>/dev/null
         case "${2:-}" in
-            list) printf '{"plugins":['; _first=1; for f in "$PLUGIN_DIR"/*.lua; do [ -f "$f" ] || continue; _bn=$(basename "$f" .lua); [ "$_first" = "1" ] && _first=0 || printf ','; printf '"%s"' "$_bn"; done; printf ']}\n' ;;
-            install) cp "${3}" "$PLUGIN_DIR/$(basename "${3}")" 2>/dev/null && echo "keyforge: installed $(basename "${3}")" || echo "keyforge: install failed" ;;
-            remove) rm -f "$PLUGIN_DIR/${3}.lua" 2>/dev/null && echo "keyforge: removed ${3}" ;;
-            enable|disable) _val="$([ "$2" = "enable" ] && echo 1 || echo 0)"; "$0" config set "plugin.${3}" "$_val"; "$0" restart ;;
-            *) echo "usage: keyforge.sh plugins {list|install|remove|enable|disable} ..." ;;
+            list)
+                printf '{"plugins":['
+                _first=1
+                for _file in "$PLUGIN_DIR"/*.lua; do
+                    [ -f "$_file" ] || continue
+                    _name="$(basename "$_file" .lua)"
+                    [ "$_first" = "1" ] && _first=0 || printf ','
+                    printf '"%s"' "$(json_escape "$_name")"
+                done
+                printf ']}\n'
+                ;;
+            config)
+                valid_key "${3:-}" || {
+                    echo "keyforge: invalid plugin id" >&2
+                    exit 2
+                }
+                cat "$DATA_DIR/configs/${3}.conf" 2>/dev/null
+                ;;
+            save-config)
+                valid_key "${3:-}" || {
+                    echo "keyforge: invalid plugin id" >&2
+                    exit 2
+                }
+                _tmp="$DATA_DIR/configs/${3}.conf.tmp.$$"
+                if printf '%s' "${4:-}" | base64 -d > "$_tmp" 2>/dev/null; then
+                    chmod 600 "$_tmp"
+                    mv -f "$_tmp" "$DATA_DIR/configs/${3}.conf"
+                    echo "keyforge: saved ${3} settings"
+                else
+                    rm -f "$_tmp"
+                    echo "keyforge: invalid settings payload" >&2
+                    exit 2
+                fi
+                ;;
+            upload)
+                _name="$(basename "${3:-}")"
+                case "$_name" in
+                    *.lua) ;;
+                    *) echo "keyforge: only .lua plugins are supported" >&2; exit 2 ;;
+                esac
+                valid_key "$_name" || {
+                    echo "keyforge: plugin filename must use letters, numbers, dot, dash, or underscore" >&2
+                    exit 2
+                }
+                _tmp="$PLUGIN_DIR/$_name.tmp.$$"
+                if printf '%s' "${4:-}" | base64 -d > "$_tmp" 2>/dev/null; then
+                    chmod 600 "$_tmp"
+                    mv -f "$_tmp" "$PLUGIN_DIR/$_name"
+                    echo "keyforge: installed $_name"
+                else
+                    rm -f "$_tmp"
+                    echo "keyforge: invalid plugin payload" >&2
+                    exit 2
+                fi
+                ;;
+            install)
+                [ -f "${3:-}" ] || {
+                    echo "keyforge: plugin file not found" >&2
+                    exit 2
+                }
+                _name="$(basename "$3")"
+                case "$_name" in
+                    *.lua) ;;
+                    *) echo "keyforge: only .lua plugins are supported" >&2; exit 2 ;;
+                esac
+                cp "$3" "$PLUGIN_DIR/$_name" 2>/dev/null &&
+                    echo "keyforge: installed $_name" ||
+                    { echo "keyforge: install failed" >&2; exit 1; }
+                ;;
+            remove)
+                valid_key "${3:-}" || {
+                    echo "keyforge: invalid plugin id" >&2
+                    exit 2
+                }
+                rm -f "$PLUGIN_DIR/${3}.lua" 2>/dev/null
+                echo "keyforge: removed ${3}"
+                ;;
+            enable|disable)
+                valid_key "${3:-}" || {
+                    echo "keyforge: invalid plugin id" >&2
+                    exit 2
+                }
+                _value=0
+                [ "$2" = "enable" ] && _value=1
+                config_set "plugin.${3}" "$_value" || exit $?
+                "$0" restart
+                ;;
+            *) echo "usage: keyforge.sh plugins {list|config|save-config|upload|install|remove|enable|disable} ..." ;;
         esac
         ;;
 
     calibrate)
         case "${2:-}" in
-            left) [ -f /tmp/keyforge_raw_L ] && read -r cx cy < /tmp/keyforge_raw_L 2>/dev/null; [ -n "$cx" ] && "$0" config set calib_lx "$cx" && "$0" config set calib_ly "$cy" && echo "keyforge: calibrate left x=$cx y=$cy" ;;
-            right) [ -f /tmp/keyforge_raw_R ] && read -r cx cy < /tmp/keyforge_raw_R 2>/dev/null; [ -n "$cx" ] && "$0" config set calib_rx "$cx" && "$0" config set calib_ry "$cy" && echo "keyforge: calibrate right x=$cx y=$cy" ;;
-            reset) "$0" config set calib_lx 0; "$0" config set calib_ly 0; "$0" config set calib_rx 0; "$0" config set calib_ry 0; echo "keyforge: calibration reset" ;;
+            left)
+                [ -f /tmp/keyforge_raw_L ] && read -r cx cy < /tmp/keyforge_raw_L 2>/dev/null
+                [ -n "${cx:-}" ] && config_set calib_lx "$cx" &&
+                    config_set calib_ly "$cy" &&
+                    echo "keyforge: calibrate left x=$cx y=$cy"
+                ;;
+            right)
+                [ -f /tmp/keyforge_raw_R ] && read -r cx cy < /tmp/keyforge_raw_R 2>/dev/null
+                [ -n "${cx:-}" ] && config_set calib_rx "$cx" &&
+                    config_set calib_ry "$cy" &&
+                    echo "keyforge: calibrate right x=$cx y=$cy"
+                ;;
+            reset)
+                config_set calib_lx 0
+                config_set calib_ly 0
+                config_set calib_rx 0
+                config_set calib_ry 0
+                echo "keyforge: calibration reset"
+                ;;
+            *) echo "usage: keyforge.sh calibrate {left|right|reset}" ;;
         esac
         ;;
 
-    log) tail -20 "$LOG" 2>/dev/null ;;
+    log)
+        tail -80 "$LOG" 2>/dev/null
+        ;;
 
-    *) echo "usage: keyforge.sh {start|stop|restart|status|manifest|config|devices|plugins|calibrate|log}" ;;
+    *)
+        echo "usage: keyforge.sh {start|stop|restart|status|runtime|hide|manifest|config|devices|plugins|calibrate|log}"
+        ;;
 esac

@@ -1,7 +1,20 @@
-name: Build
+name: CI
 
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   build:
@@ -9,10 +22,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Build WebUI
+        working-directory: webui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Verify generated WebUI
+        run: git diff --exit-code -- module/webroot
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: daemon -> target
+          cache-on-failure: true
+
+      - name: Validate module scripts
+        run: sh -n module/keyforge.sh module/service.sh module/customize.sh module/uninstall.sh
+
+      - name: Test daemon
+        working-directory: daemon
+        run: cargo test --locked
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
@@ -20,35 +62,34 @@ jobs:
           ndk-version: r27c
           add-to-path: false
 
-      - name: Clippy
+      - name: Lint and build Android daemon
         working-directory: daemon
         run: |
           NDK=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
           export CC_aarch64_linux_android=$NDK/aarch64-linux-android21-clang
           export AR_aarch64_linux_android=$NDK/llvm-ar
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK/aarch64-linux-android21-clang
-          cargo clippy --release --target aarch64-linux-android -- -D warnings
+          cargo clippy --locked --release --target aarch64-linux-android -- -D warnings
+          cargo build --locked --release --target aarch64-linux-android
 
-      - name: Build daemon
-        working-directory: daemon
+      - name: Package module ZIP
         run: |
-          NDK=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
-          export CC_aarch64_linux_android=$NDK/aarch64-linux-android21-clang
-          export AR_aarch64_linux_android=$NDK/llvm-ar
-          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK/aarch64-linux-android21-clang
-          cargo build --release --target aarch64-linux-android
-
-      - name: Package module zip
-        run: |
-          mkdir -p pkg/webroot pkg/plugins
+          rm -rf pkg
+          mkdir -p pkg
+          cp -a module/. pkg/
           cp daemon/target/aarch64-linux-android/release/keyforge pkg/
-          cp module/module.prop module/service.sh module/keyforge.sh pkg/
-          cp module/webroot/index.html pkg/webroot/
-          chmod 755 pkg/keyforge pkg/keyforge.sh pkg/service.sh
-          cd pkg && zip -r ../keyforge.zip . && cd ..
-          echo "Package: $(ls -lh keyforge.zip)"
+          chmod 755 pkg/keyforge pkg/keyforge.sh pkg/service.sh pkg/customize.sh pkg/uninstall.sh
+          test -f pkg/module.prop
+          test -f pkg/webroot/index.html
+          test -f pkg/skip_mount
+          (cd pkg && zip -r ../keyforge.zip .)
+          unzip -t keyforge.zip
+          sha256sum keyforge.zip
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload module
+        uses: actions/upload-artifact@v4
         with:
-          name: keyforge
+          name: keyforge-${{ github.sha }}
           path: keyforge.zip
+          if-no-files-found: error
+          retention-days: 14

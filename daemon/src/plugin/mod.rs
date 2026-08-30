@@ -28,7 +28,7 @@ pub struct SettingDef {
 pub struct LuaProcessor {
     #[allow(dead_code)]
     pub meta: PluginMeta,
-    lua: &'static Lua,
+    lua: Lua,
     process_fn: Function,
     /// Per-plugin config loaded from /sdcard/.keyforge/configs/<id>.conf
     plugin_config: HashMap<String, String>,
@@ -38,17 +38,17 @@ impl Processor for LuaProcessor {
     fn id(&self) -> &str { &self.meta.id }
 
     fn process(&self, event: &mut Event, ctx: &mut Ctx) {
-        let table = match build_event_table(self.lua, event) { Ok(t) => t, Err(e) => { eprintln!("keyforge[{}]: build_event_table: {}", self.meta.id, e); return; } };
+        let table = match build_event_table(&self.lua, event) { Ok(t) => t, Err(e) => { eprintln!("keyforge[{}]: build_event_table: {}", self.meta.id, e); return; } };
         // Merge global config with per-plugin config (per-plugin takes priority)
         let mut merged = ctx.settings.clone();
         for (k, v) in &self.plugin_config { merged.insert(k.clone(), v.clone()); }
-        let cfg = match build_cfg_table(self.lua, &merged) { Ok(t) => t, Err(e) => { eprintln!("keyforge[{}]: build_cfg_table: {}", self.meta.id, e); return; } };
+        let cfg = match build_cfg_table(&self.lua, &merged) { Ok(t) => t, Err(e) => { eprintln!("keyforge[{}]: build_cfg_table: {}", self.meta.id, e); return; } };
 
         let emits_buf: Arc<Mutex<Vec<EmitEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let drop_flag: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let raw_x = match event { Event::Stick { x, .. } => *x, _ => 0 };
         let raw_y = match event { Event::Stick { y, .. } => *y, _ => 0 };
-        let pf = match api::build_pf(self.lua, &emits_buf, &drop_flag, raw_x, raw_y) { Ok(t) => t, Err(e) => { eprintln!("keyforge[{}]: build_pf: {}", self.meta.id, e); return; } };
+        let pf = match api::build_pf(&self.lua, &emits_buf, &drop_flag, raw_x, raw_y) { Ok(t) => t, Err(e) => { eprintln!("keyforge[{}]: build_pf: {}", self.meta.id, e); return; } };
 
         let result: mlua::Result<Value> = self.process_fn.call::<Value>((table, cfg, pf));
         match &result {
@@ -99,7 +99,7 @@ fn apply_result(event: &mut Event, t: &Table) {
 }
 
 pub fn load_plugins(
-    lua: &'static Lua, plugin_dir: &str, pipeline: &mut Pipeline,
+    lua: &Lua, plugin_dir: &str, pipeline: &mut Pipeline,
     config_values: &HashMap<String, String>,
 ) -> Vec<PluginMeta> {
     let mut metas = Vec::new();
@@ -145,7 +145,7 @@ pub fn load_plugins(
         let meta = PluginMeta { id: id.clone(), name, version, author, description, enabled, settings };
         if meta.enabled {
             eprintln!("keyforge: plugin loaded: {} ({} config keys)", id, plugin_config.len());
-            pipeline.add(Box::new(LuaProcessor { meta: meta.clone(), lua, process_fn, plugin_config }));
+            pipeline.add(Box::new(LuaProcessor { meta: meta.clone(), lua: lua.clone(), process_fn, plugin_config }));
         } else {
             eprintln!("keyforge: plugin disabled: {}", id);
         }

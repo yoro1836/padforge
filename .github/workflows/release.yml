@@ -6,20 +6,75 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version (e.g. 1.0.0)'
+        description: 'Version (for example, 1.1.0)'
         required: true
         type: string
 
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  daemon:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$REQUESTED_VERSION" ]; then
+            VERSION="${REQUESTED_VERSION#v}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: $VERSION" >&2
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Build WebUI
+        working-directory: webui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Verify generated WebUI
+        run: git diff --exit-code -- module/webroot
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: daemon -> target
+          cache-on-failure: true
+
+      - name: Validate module scripts
+        run: sh -n module/keyforge.sh module/service.sh module/customize.sh module/uninstall.sh
+
+      - name: Test daemon
+        working-directory: daemon
+        run: cargo test --locked
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
@@ -27,76 +82,51 @@ jobs:
           ndk-version: r27c
           add-to-path: false
 
-      - name: Clippy
+      - name: Lint and build Android daemon
         working-directory: daemon
         run: |
           NDK=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
           export CC_aarch64_linux_android=$NDK/aarch64-linux-android21-clang
           export AR_aarch64_linux_android=$NDK/llvm-ar
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK/aarch64-linux-android21-clang
-          cargo clippy --release --target aarch64-linux-android -- -D warnings
+          cargo clippy --locked --release --target aarch64-linux-android -- -D warnings
+          cargo build --locked --release --target aarch64-linux-android
 
-      - name: Build daemon
-        working-directory: daemon
+      - name: Package module
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
         run: |
-          NDK=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
-          export CC_aarch64_linux_android=$NDK/aarch64-linux-android21-clang
-          export AR_aarch64_linux_android=$NDK/llvm-ar
-          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK/aarch64-linux-android21-clang
-          cargo build --release --target aarch64-linux-android
+          rm -rf pkg
+          mkdir -p pkg
+          cp -a module/. pkg/
+          cp daemon/target/aarch64-linux-android/release/keyforge pkg/
+          sed -i "s/^version=.*/version=v${VERSION}/" pkg/module.prop
+          sed -i "s/^versionCode=.*/versionCode=$(date -u +%s)/" pkg/module.prop
+          chmod 755 pkg/keyforge pkg/keyforge.sh pkg/service.sh pkg/customize.sh pkg/uninstall.sh
+          test -f pkg/webroot/index.html
+          test -f pkg/skip_mount
+          ZIP="keyforge-v${VERSION}.zip"
+          (cd pkg && zip -r "../${ZIP}" .)
+          unzip -t "$ZIP"
+          sha256sum "$ZIP" > "$ZIP.sha256"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
 
-      - name: Upload daemon binary
+      - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: daemon
-          path: daemon/target/aarch64-linux-android/release/keyforge
+          name: keyforge-v${{ steps.version.outputs.value }}
+          path: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.zip }}.sha256
+          if-no-files-found: error
 
-  apk:
-    needs: daemon
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Determine version
-        id: ver
-        run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            VER="${{ github.event.inputs.version }}"
-          else
-            VER="${GITHUB_REF_NAME#v}"
-          fi
-          echo "version=$VER" >> $GITHUB_OUTPUT
-
-      - name: Setup JDK
-        uses: actions/setup-java@v4
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
         with:
-          distribution: temurin
-          java-version: 17
-
-      - name: Download daemon binary
-        uses: actions/download-artifact@v4
-        with:
-          name: daemon
-          path: app/src/main/assets/
-
-      - name: Setup Gradle
-        uses: gradle/gradle-build-action@v3
-
-      - name: Restore keystore
-        env:
-          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
-        run: echo "$KEYSTORE_B64" | base64 -d > app/keyforge.jks
-
-      - name: Build Release APK
-        run: gradle assembleRelease
-        env:
-          ORG_GRADLE_PROJECT_KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
-          ORG_GRADLE_PROJECT_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          ORG_GRADLE_PROJECT_KEY_PASS: ${{ secrets.KEY_PASS }}
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: v${{ steps.ver.outputs.version }}
-          files: app/build/outputs/apk/release/app-release.apk
+          tag_name: v${{ steps.version.outputs.value }}
+          files: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.zip }}.sha256
+          fail_on_unmatched_files: true
           generate_release_notes: true

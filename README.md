@@ -1,10 +1,10 @@
 # KeyForge
 
-Lua-scriptable input automation for Android. Intercept, transform, and emit
-evdev events at the kernel level — any key, any axis, any device.
+Lua-scriptable input automation for rooted Android. Intercept, transform, and emit
+evdev events at the kernel boundary — any key, any axis, any device.
 
-Like AutoHotkey, but runs as an [AX Manager](https://github.com/ktanon/AX-Manager) module
-with direct access to `/dev/input`.
+KeyForge ships as one module ZIP for AX Manager, KernelSU, and Magisk, with
+direct access to `/dev/input`.
 
 ## How It Works
 
@@ -18,19 +18,44 @@ with direct access to `/dev/input`.
 - **Lua pipeline** — chain plugins that process stick, trigger, and button events
 - **Plugin API** — `pf.emit(type, code, value)`, `pf.drop()`, `pf.log()` for full control
 - **Device mirroring** — copies physical device capabilities (keys, axes, absinfo) to virtual device
-- **WebUI** — device selector, plugin manager, per-plugin settings with live reload
+- **Physical-device hiding** — KernelSU/Magisk can revoke Android access to the selected event node
+- **Vue WebUI** — offline Vue 3 interface with a Material 3 Expressive design
 - **Hot reload** — config changes detected within 500ms, no restart needed
 - **Per-plugin config** — settings saved to `/sdcard/.keyforge/configs/<id>.conf`
-- **AX Manager module** — no APK needed, install as zip via AX Manager
+- **Cross-manager module** — one ZIP supports AX Manager, KernelSU, and Magisk
 
 ## Install
 
-1. Install [AX Manager](https://github.com/ktanon/AX-Manager)
-2. Download `keyforge.zip` from [Releases](https://github.com/yoro1836/keyforge/releases)
-3. Import as module in AX Manager
-4. Start the module, open WebUI
-5. Select your controller from the device dropdown
-6. Add plugins from [keyforge-plugins](https://github.com/yoro1836/keyforge-plugins)
+### KernelSU or Magisk
+
+1. Download `keyforge.zip` from [Releases](https://github.com/yoro1836/keyforge/releases).
+2. Install the ZIP from the manager's Modules screen, then reboot.
+3. In KernelSU, open KeyForge's WebUI and select a controller.
+4. Add plugins from [keyforge-plugins](https://github.com/yoro1836/keyforge-plugins).
+
+Magisk runs the same boot service and device-hiding implementation. Because the
+official Magisk app does not host module WebUIs, open KeyForge through a
+compatible Magisk module WebUI client; all configuration remains in the same UI.
+
+### AX Manager
+
+1. Import the same module ZIP in AX Manager.
+2. Start the module, open its WebUI, and select a controller.
+
+## Physical-device hiding
+
+Use the WebUI for the complete flow:
+
+1. Scan and select the controller under **Source device**.
+2. Turn on **Hide physical device** for that selected controller.
+3. The status chip confirms when its physical event node is hidden.
+
+KeyForge opens and exclusively grabs the selected `/dev/input/event*` node,
+records its original mode, then changes that node to mode `000`. Android
+userspace receives input only from the KeyForge virtual controller. Disabling
+the option, stopping the daemon, starting after an interrupted run, or
+uninstalling the module restores the recorded mode. AX Manager continues to use
+exclusive evdev grabbing without changing device-node permissions.
 
 ## Plugin API
 
@@ -82,16 +107,19 @@ automatically. Supported kinds: `"toggle"`, `"permille"` (0-1000‰ with slider)
 ## Structure
 
 ```
-module/            AX Manager module files
-  keyforge.sh      Control script (start/stop/status/config/plugins/devices)
-  webroot/
-    index.html     Single-file WebUI (device selector, plugin manager, settings)
-  module.prop      AX Manager module manifest
-  service.sh       Module entry point
+module/            Installable AX Manager / KernelSU / Magisk module
+  keyforge.sh      Control script and manager/runtime detection
+  customize.sh     KernelSU/Magisk installer permissions and ABI check
+  service.sh       Late-start module entry point
+  uninstall.sh     Daemon and hidden-device cleanup
+  webroot/         Built, fully offline WebUI assets
+webui/             Vue 3 + Vite WebUI source
+  src/App.vue      Device, hiding, plugin, and daemon controls
+  src/bridge.js    AX Manager and KernelSU command bridge adapter
 daemon/            Rust daemon (evdev → pipeline → uinput)
   src/
-    main.rs        Event loop (epoll, config polling, inotify hotplug)
-    core.rs        FFI, ioctl, Device, uinput setup
+    main.rs        Event loop, config polling, hotplug, visibility changes
+    core.rs        FFI, ioctl, Device, uinput, device-mode restoration
     pipeline.rs    Event types, pipeline, Processor trait, EmitEvent
     plugin/
       mod.rs       Lua plugin loader, LuaProcessor
@@ -101,25 +129,36 @@ daemon/            Rust daemon (evdev → pipeline → uinput)
 
 ## Data
 
-All user data under `/sdcard/.keyforge/`:
+Plugin data is stored under `/sdcard/.keyforge/`:
 ```
 /sdcard/.keyforge/
   manifest.json         Plugin manifest (auto-generated)
   plugins/*.lua         Installed plugin files
   configs/<id>.conf     Per-plugin settings
-  keyforge.conf         Main config (VID, PID, plugin_dir)
 ```
+
+The main runtime config and hidden-device recovery state stay inside the module
+directory so boot scripts can read them before shared storage is available.
 
 ## Build
 
 ```sh
-# daemon (ARM64 Android)
-cd daemon
-cargo build --release --target aarch64-linux-android
+# offline WebUI assets (writes module/webroot)
+cd webui
+npm ci
+npm run build
 
-# module zip
-cd module
-zip keyforge.zip module.prop service.sh keyforge.sh keyforge webroot/index.html
+# daemon (ARM64 Android)
+cd ../daemon
+cargo build --locked --release --target aarch64-linux-android
+
+# module ZIP
+cd ..
+rm -rf pkg && mkdir pkg
+cp -a module/. pkg/
+cp daemon/target/aarch64-linux-android/release/keyforge pkg/
+chmod 755 pkg/keyforge pkg/*.sh
+(cd pkg && zip -r ../keyforge.zip .)
 ```
 
 ## License

@@ -1,5 +1,6 @@
 /daemon/target
-**/Cargo.lock
 *.zip
+/pkg
 .DS_Store
 /web/node_modules
+/webui/node_modules
