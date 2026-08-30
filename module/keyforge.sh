@@ -4,8 +4,8 @@
 MODDIR="${0%/*}"
 BIN="$MODDIR/keyforge"
 CONF="$MODDIR/keyforge.conf"
-WATCH_PIDFILE="$MODDIR/keyforge-watch.pid"
-REQUEST_FLAG="$MODDIR/.kf-request"
+PIDFILE="$MODDIR/keyforge.pid"
+LOG="$MODDIR/keyforge.log"
 HIDDEN_STATE="$MODDIR/.hidden-device.json"
 DATA_DIR="/sdcard/.keyforge"
 MANIFEST="$DATA_DIR/manifest.json"
@@ -48,32 +48,6 @@ is_running() {
     esac
     rm -f "$PIDFILE"
     return 1
-}
-
-is_watch_running() {
-    [ -f "$WATCH_PIDFILE" ] || return 1
-    _wpid=""
-    read -r _wpid < "$WATCH_PIDFILE" 2>/dev/null || return 1
-    [ -n "$_wpid" ] && [ -r "/proc/$_wpid/cmdline" ] || {
-        rm -f "$WATCH_PIDFILE"
-        return 1
-    }
-    _wcmd="$(tr '\000' ' ' < "/proc/$_wpid/cmdline" 2>/dev/null)"
-    case "$_wcmd" in
-        *keyforge.sh*watch*) return 0 ;;
-    esac
-    rm -f "$WATCH_PIDFILE"
-    return 1
-}
-
-spawn_detached() {
-    # stdin must not inherit the caller's pipe: when the WebUI (or any short
-    # lived shell) closes, a live stdin can take the daemon down with it.
-    if command -v setsid >/dev/null 2>&1; then
-        setsid "$@" < /dev/null &
-    else
-        nohup "$@" < /dev/null &
-    fi
 }
 
 valid_key() {
@@ -179,20 +153,24 @@ case "${1:-}" in
         restore_hidden_device
         log "starting daemon on $(detect_framework)"
         if supports_device_hide; then
-            spawn_detached "$BIN" --config "$CONF" --hidden-state "$HIDDEN_STATE" \
-                --allow-device-hide >> "$LOG" 2>&1
+            "$BIN" --config "$CONF" --hidden-state "$HIDDEN_STATE" \
+                --allow-device-hide --pidfile "$PIDFILE" >> "$LOG" 2>&1 < /dev/null
         else
-            spawn_detached "$BIN" --config "$CONF" --hidden-state "$HIDDEN_STATE" \
-                >> "$LOG" 2>&1
+            "$BIN" --config "$CONF" --hidden-state "$HIDDEN_STATE" \
+                --pidfile "$PIDFILE" >> "$LOG" 2>&1 < /dev/null
         fi
-        _bpid=$!
-        echo "$_bpid" > "$PIDFILE"
-        sleep 0.3
-        if [ -d "/proc/$_bpid" ]; then
-            log "started (pid=$_bpid)"
-            echo "keyforge: started (pid=$_bpid)"
+        # The daemon double-forks and writes its own pidfile; the call above
+        # returns as soon as the first child detaches.
+        _wait=0
+        while [ "$_wait" -lt 15 ]; do
+            is_running && break
+            sleep 0.1
+            _wait=$((_wait + 1))
+        done
+        if is_running; then
+            log "started (pid=$(cat "$PIDFILE"))"
+            echo "keyforge: started (pid=$(cat "$PIDFILE"))"
         else
-            rm -f "$PIDFILE"
             restore_hidden_device
             log "died"
             echo "keyforge: FAILED - see $LOG"
@@ -219,43 +197,6 @@ case "${1:-}" in
             restore_hidden_device
             echo "keyforge: not running"
         fi
-        ;;
-
-    request)
-        case "${2:-}" in
-            start|stop|restart)
-                if is_watch_running; then
-                    printf '%s\n' "$2" > "$REQUEST_FLAG"
-                    echo "keyforge: $2 requested (supervisor will apply it)"
-                else
-                    sh "$0" "$2"
-                fi
-                ;;
-            *) echo "usage: keyforge.sh request {start|stop|restart}" >&2; exit 2 ;;
-        esac
-        ;;
-
-    watch)
-        if is_watch_running; then
-            echo "keyforge: supervisor already running (pid $(cat "$WATCH_PIDFILE"))"
-            exit 0
-        fi
-        echo $$ > "$WATCH_PIDFILE"
-        log "supervisor started (pid=$$)"
-        while :; do
-            if [ -f "$REQUEST_FLAG" ]; then
-                _action=""
-                read -r _action < "$REQUEST_FLAG" 2>/dev/null || :
-                rm -f "$REQUEST_FLAG"
-                case "$_action" in
-                    start|stop|restart)
-                        log "supervisor: $_action requested"
-                        "$0" "$_action" >> "$LOG" 2>&1
-                        ;;
-                esac
-            fi
-            sleep 1
-        done
         ;;
 
     restart)
@@ -477,7 +418,7 @@ case "${1:-}" in
                 _value=0
                 [ "$2" = "enable" ] && _value=1
                 config_set "plugin.${3}" "$_value" || exit $?
-                "$0" request restart
+                "$0" restart
                 ;;
             *) echo "usage: keyforge.sh plugins {list|config|save-config|upload|install|remove|enable|disable} ..." ;;
         esac
@@ -513,6 +454,6 @@ case "${1:-}" in
         ;;
 
     *)
-        echo "usage: keyforge.sh {start|stop|restart|status|runtime|hide|request|manifest|config|devices|plugins|calibrate|log|watch}"
+        echo "usage: keyforge.sh {start|stop|restart|status|runtime|hide|manifest|config|devices|plugins|calibrate|log}"
         ;;
 esac

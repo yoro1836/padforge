@@ -1,8 +1,7 @@
 #!/system/bin/sh
-# Late-start entry point: boot the daemon and a supervisor so the daemon
-# always lives outside the WebUI app's process tree.
+# Late-start entry point. The daemon double-forks itself into the init
+# ownership, so a plain foreground call is all that is needed here.
 
 MODDIR="${0%/*}"
 
-sh "$MODDIR/keyforge.sh" start >/dev/null 2>&1
-nohup sh "$MODDIR/keyforge.sh" watch >/dev/null 2>&1 &
+sh "$MODDIR/keyforge.sh" start

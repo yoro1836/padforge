@@ -26,6 +26,8 @@ fn main() {
     let mut allow_device_hide = false;
     let mut hidden_state_path: Option<PathBuf> = None;
     let mut restore_hidden_state: Option<PathBuf> = None;
+    let mut pidfile_path: Option<PathBuf> = None;
+    let mut foreground = false;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -35,9 +37,15 @@ fn main() {
                 }
             }
             "--allow-device-hide" => allow_device_hide = true,
+            "--foreground" => foreground = true,
             "--hidden-state" => {
                 if let Some(path) = args.next() {
                     hidden_state_path = Some(PathBuf::from(path));
+                }
+            }
+            "--pidfile" => {
+                if let Some(path) = args.next() {
+                    pidfile_path = Some(PathBuf::from(path));
                 }
             }
             "--restore-hidden-state" => {
@@ -76,6 +84,42 @@ fn main() {
     if cfg.hide_device && !allow_device_hide {
         eprintln!("keyforge: device hiding ignored outside KernelSU or Magisk");
     }
+
+    // Detach from the caller (double fork, like encored) so the daemon always
+    // ends up owned by init — never by a WebUI app or any short-lived shell.
+    // The final child writes its own pidfile; the invoking script never has to
+    // trust `$!`.
+    if !foreground {
+        unsafe {
+            let pid = fork();
+            if pid < 0 {
+                eprintln!("keyforge: fork failed");
+                _exit(1);
+            }
+            if pid > 0 {
+                _exit(0);
+            }
+            if setsid() < 0 {
+                eprintln!("keyforge: setsid failed");
+                _exit(1);
+            }
+            let pid = fork();
+            if pid < 0 {
+                eprintln!("keyforge: fork failed");
+                _exit(1);
+            }
+            if pid > 0 {
+                _exit(0);
+            }
+        }
+        if let Some(pidfile) = pidfile_path.as_deref()
+            && let Err(error) = fs::write(pidfile, format!("{}\n", std::process::id()))
+        {
+            eprintln!("keyforge: failed to write pidfile {pidfile:?}: {error}");
+            std::process::exit(1);
+        }
+    }
+
     let lua = Lua::new();
     let mut pipeline = Pipeline::new();
     // /sdcard (FUSE) may not be mounted yet when the daemon starts from

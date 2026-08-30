@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 // Raw FFI
 // ---------------------------------------------------------------------------
 unsafe extern "C" {
+    pub fn _exit(code: i32) -> !;
+    pub fn fork() -> i32;
     pub fn open(path: *const c_char, flags: i32, mode: u32) -> i32;
     pub fn close(fd: i32) -> i32;
     pub fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
@@ -23,6 +25,7 @@ unsafe extern "C" {
     pub fn inotify_add_watch(fd: i32, pathname: *const c_char, mask: u32) -> i32;
     pub fn chown(path: *const c_char, owner: u32, group: u32) -> i32;
     pub fn mknod(path: *const c_char, mode: u32, dev: u64) -> i32;
+    pub fn setsid() -> i32;
 }
 
 // ---------------------------------------------------------------------------
