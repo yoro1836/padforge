@@ -317,6 +317,7 @@ fn main() {
                         if dropped {
                             skip = true;
                         } else {
+                            iev.code = e.code();
                             iev.value = if e.pressed() { 1 } else { 0 };
                         }
                     }

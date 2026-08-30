@@ -91,6 +91,11 @@ return {
 | `"trigger"` | `value, side` | Trigger (value = 0..32767) |
 | `"button"` | `code, pressed` | Button (pressed = boolean) |
 
+Plugins run in load order and share one event. `pf.emit` targeting the current
+event's own axes or button replaces its values in place (so later plugins see
+the result); `pf.drop` without a replacement suppresses the event. Emits for
+other axes, buttons, or with `hold_ms` go straight to the virtual device.
+
 ### pf API
 
 | Function | Description |
