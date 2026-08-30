@@ -18,7 +18,7 @@ direct access to `/dev/input`.
 - **Lua pipeline** — chain plugins that process stick, trigger, and button events
 - **Plugin API** — `pf.emit(type, code, value)`, `pf.drop()`, `pf.log()` for full control
 - **Device mirroring** — copies physical device capabilities (keys, axes, absinfo) to virtual device
-- **Physical-device hiding** — KernelSU/Magisk can revoke Android access to the selected event node
+- **Physical-device hiding** — KernelSU/Magisk can unlink the selected event node so Android unregisters the physical controller
 - **Vue WebUI** — offline Vue 3 interface with a Material 3 Expressive design
 - **Hot reload** — config changes detected within 500ms, no restart needed
 - **Per-plugin config** — settings saved to `/sdcard/.keyforge/configs/<id>.conf`
@@ -51,11 +51,14 @@ Use the WebUI for the complete flow:
 3. The status chip confirms when its physical event node is hidden.
 
 KeyForge opens and exclusively grabs the selected `/dev/input/event*` node,
-records its original mode, then changes that node to mode `000`. Android
-userspace receives input only from the KeyForge virtual controller. Disabling
-the option, stopping the daemon, starting after an interrupted run, or
-uninstalling the module restores the recorded mode. AX Manager continues to use
-exclusive evdev grabbing without changing device-node permissions.
+hard-links it to a private `/dev/.keyforge-input-*` name, then removes the
+original name. Android's EventHub receives the inotify removal event and
+unregisters the physical controller, so apps only see the KeyForge virtual
+controller. Disabling the option, stopping the daemon, starting after an
+interrupted run, or uninstalling the module restores the original node (only
+when the same device is still present). KeyForge also migrates state written by
+older permission-based builds. AX Manager continues to use exclusive evdev
+grabbing without changing device-node permissions.
 
 ## Plugin API
 
@@ -119,7 +122,7 @@ webui/             Vue 3 + Vite WebUI source
 daemon/            Rust daemon (evdev → pipeline → uinput)
   src/
     main.rs        Event loop, config polling, hotplug, visibility changes
-    core.rs        FFI, ioctl, Device, uinput, device-mode restoration
+    core.rs        FFI, ioctl, Device, uinput, device-node isolation and recovery
     pipeline.rs    Event types, pipeline, Processor trait, EmitEvent
     plugin/
       mod.rs       Lua plugin loader, LuaProcessor

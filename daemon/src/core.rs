@@ -59,7 +59,7 @@ pub struct InputEvent {
 }
 
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InputId {
     pub bustype: u16,
     pub vendor: u16,
@@ -199,21 +199,70 @@ pub unsafe fn write_ev(ufd: i32, ev: &InputEvent) {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct HiddenDeviceState {
     path: PathBuf,
+    hidden_path: PathBuf,
+    dev: u64,
+    ino: u64,
+    rdev: u64,
+    input_id: InputId,
+}
+
+#[derive(Debug, Deserialize)]
+struct PermissionHiddenDeviceState {
+    path: PathBuf,
     mode: u32,
     dev: u64,
     ino: u64,
     rdev: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PersistedHiddenDeviceState {
+    Isolated(HiddenDeviceState),
+    Permission(PermissionHiddenDeviceState),
+}
+
+fn metadata_if_exists(path: &Path) -> io::Result<Option<fs::Metadata>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn input_id_for_fd(fd: i32) -> io::Result<InputId> {
+    let mut input_id = InputId::default();
+    if unsafe { do_ioctl_ptr(fd, EVIOCGID, &mut input_id) } == 0 {
+        Ok(input_id)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn input_id_for_path(path: &Path) -> io::Result<Option<InputId>> {
+    let cpath = CString::new(path.to_string_lossy().as_bytes())
+        .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+    let fd = unsafe { open(cpath.as_ptr(), O_RDONLY | O_NONBLOCK, 0) };
+    if fd < 0 {
+        return Ok(None);
+    }
+    let input_id = input_id_for_fd(fd).ok();
+    unsafe {
+        close(fd);
+    }
+    Ok(input_id)
+}
+
 impl HiddenDeviceState {
-    fn capture(path: &Path) -> io::Result<Self> {
+    fn capture(path: &Path, hidden_path: PathBuf, input_id: InputId) -> io::Result<Self> {
         let metadata = fs::metadata(path)?;
         Ok(Self {
             path: path.to_path_buf(),
-            mode: metadata.mode() & 0o7777,
+            hidden_path,
             dev: metadata.dev(),
             ino: metadata.ino(),
             rdev: metadata.rdev(),
+            input_id,
         })
     }
 
@@ -230,23 +279,74 @@ impl HiddenDeviceState {
         fs::rename(temporary, state_path)
     }
 
+    fn remove_hidden_link(&self) -> io::Result<()> {
+        if let Some(metadata) = metadata_if_exists(&self.hidden_path)?
+            && self.matches(&metadata)
+        {
+            fs::remove_file(&self.hidden_path)?;
+        }
+        Ok(())
+    }
+
+    fn discard(&self) -> io::Result<()> {
+        self.remove_hidden_link()
+    }
+
+    fn restore(&self, validate_input: bool) -> io::Result<bool> {
+        if metadata_if_exists(&self.path)?.is_some() {
+            self.remove_hidden_link()?;
+            return Ok(false);
+        }
+
+        let Some(hidden_metadata) = metadata_if_exists(&self.hidden_path)? else {
+            return Ok(false);
+        };
+        if !self.matches(&hidden_metadata) {
+            return Ok(false);
+        }
+
+        if validate_input && input_id_for_path(&self.hidden_path)? != Some(self.input_id) {
+            self.remove_hidden_link()?;
+            return Ok(false);
+        }
+
+        fs::hard_link(&self.hidden_path, &self.path)?;
+        if validate_input && input_id_for_path(&self.path)? != Some(self.input_id) {
+            fs::remove_file(&self.path)?;
+            self.remove_hidden_link()?;
+            return Ok(false);
+        }
+        fs::remove_file(&self.hidden_path)?;
+        Ok(true)
+    }
+}
+
+impl PermissionHiddenDeviceState {
+    fn restore(&self) -> io::Result<bool> {
+        let Some(metadata) = metadata_if_exists(&self.path)? else {
+            return Ok(false);
+        };
+        if self.dev != metadata.dev() || self.ino != metadata.ino() || self.rdev != metadata.rdev()
+        {
+            return Ok(false);
+        }
+        fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode))?;
+        Ok(true)
+    }
+}
+
+impl PersistedHiddenDeviceState {
     fn load(state_path: &Path) -> io::Result<Self> {
         let encoded = fs::read(state_path)?;
         serde_json::from_slice(&encoded)
             .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
     }
 
-    fn restore(&self) -> io::Result<bool> {
-        let metadata = match fs::metadata(&self.path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        if !self.matches(&metadata) {
-            return Ok(false);
+    fn restore(&self, validate_input: bool) -> io::Result<bool> {
+        match self {
+            Self::Isolated(state) => state.restore(validate_input),
+            Self::Permission(state) => state.restore(),
         }
-        fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode))?;
-        Ok(true)
     }
 }
 
@@ -281,12 +381,15 @@ impl Device {
         }
     }
 
-    pub fn restore_hidden_state(state_path: &Path) -> io::Result<bool> {
+    fn restore_hidden_state_with_validation(
+        state_path: &Path,
+        validate_input: bool,
+    ) -> io::Result<bool> {
         if !state_path.exists() {
             return Ok(false);
         }
-        let state = HiddenDeviceState::load(state_path)?;
-        let restored = state.restore()?;
+        let state = PersistedHiddenDeviceState::load(state_path)?;
+        let restored = state.restore(validate_input)?;
         match fs::remove_file(state_path) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -295,10 +398,18 @@ impl Device {
         Ok(restored)
     }
 
+    pub fn restore_hidden_state(state_path: &Path) -> io::Result<bool> {
+        Self::restore_hidden_state_with_validation(state_path, true)
+    }
+
     pub fn set_hidden(&mut self, hide: bool) -> io::Result<()> {
         if !hide {
             let restored = if let Some(state) = self.hidden.as_ref() {
-                state.restore().map(|_| ())
+                if Self::is_alive(self.fd) {
+                    state.restore(true).map(|_| ())
+                } else {
+                    state.discard()
+                }
             } else if let Some(state_path) = self.hide_state_path.as_ref()
                 && state_path.exists()
             {
@@ -323,10 +434,10 @@ impl Device {
         if self.hidden.is_some() {
             return Ok(());
         }
-        let path = self.path.as_ref().ok_or_else(|| {
+        let path = self.path.clone().ok_or_else(|| {
             io::Error::new(ErrorKind::NotFound, "no physical input device is connected")
         })?;
-        let state_path = self.hide_state_path.as_ref().ok_or_else(|| {
+        let state_path = self.hide_state_path.clone().ok_or_else(|| {
             io::Error::new(
                 ErrorKind::InvalidInput,
                 "hidden-device state path was not provided",
@@ -334,12 +445,42 @@ impl Device {
         })?;
 
         if state_path.exists() {
-            Self::restore_hidden_state(state_path)?;
+            Self::restore_hidden_state(&state_path)?;
         }
-        let state = HiddenDeviceState::capture(path)?;
-        state.save(state_path)?;
-        if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(0o000)) {
-            let _ = fs::remove_file(state_path);
+
+        let file_name = path.file_name().ok_or_else(|| {
+            io::Error::new(ErrorKind::InvalidInput, "input device path has no filename")
+        })?;
+        let hidden_path =
+            Path::new("/dev").join(format!(".keyforge-input-{}", file_name.to_string_lossy()));
+        if let Some(hidden_metadata) = metadata_if_exists(&hidden_path)? {
+            let path_metadata = fs::metadata(&path)?;
+            if hidden_metadata.dev() == path_metadata.dev()
+                && hidden_metadata.ino() == path_metadata.ino()
+                && hidden_metadata.rdev() == path_metadata.rdev()
+            {
+                fs::remove_file(&hidden_path)?;
+            } else {
+                return Err(io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    format!(
+                        "hidden device path already exists: {}",
+                        hidden_path.display()
+                    ),
+                ));
+            }
+        }
+
+        let input_id = input_id_for_fd(self.fd)?;
+        let state = HiddenDeviceState::capture(&path, hidden_path, input_id)?;
+        state.save(&state_path)?;
+        if let Err(error) = fs::hard_link(&state.path, &state.hidden_path) {
+            let _ = fs::remove_file(&state_path);
+            return Err(error);
+        }
+        if let Err(error) = fs::remove_file(&state.path) {
+            let _ = fs::remove_file(&state.hidden_path);
+            let _ = fs::remove_file(&state_path);
             return Err(error);
         }
         self.hidden = Some(state);
@@ -500,41 +641,95 @@ mod tests {
         path
     }
 
+    fn isolate_test_node(device: &Path, hidden: &Path, state_path: &Path) -> HiddenDeviceState {
+        let state =
+            HiddenDeviceState::capture(device, hidden.to_path_buf(), InputId::default()).unwrap();
+        state.save(state_path).unwrap();
+        fs::hard_link(device, hidden).unwrap();
+        fs::remove_file(device).unwrap();
+        state
+    }
+
     #[test]
-    fn hidden_state_restores_original_mode() {
-        let dir = test_dir("restore-mode");
+    fn isolated_node_restores_the_original_link() {
+        let dir = test_dir("restore-link");
         let device = dir.join("event7");
+        let hidden = dir.join(".keyforge-event7");
         let state_path = dir.join("hidden.json");
         fs::write(&device, b"device").unwrap();
         fs::set_permissions(&device, fs::Permissions::from_mode(0o640)).unwrap();
+        let original_inode = fs::metadata(&device).unwrap().ino();
 
-        let state = HiddenDeviceState::capture(&device).unwrap();
-        state.save(&state_path).unwrap();
-        fs::set_permissions(&device, fs::Permissions::from_mode(0o000)).unwrap();
+        isolate_test_node(&device, &hidden, &state_path);
+        assert!(!device.exists());
+        assert!(hidden.exists());
 
-        assert!(Device::restore_hidden_state(&state_path).unwrap());
-        assert_eq!(fs::metadata(&device).unwrap().mode() & 0o7777, 0o640);
+        assert!(Device::restore_hidden_state_with_validation(&state_path, false).unwrap());
+        let restored = fs::metadata(&device).unwrap();
+        assert_eq!(restored.ino(), original_inode);
+        assert_eq!(restored.mode() & 0o7777, 0o640);
+        assert!(!hidden.exists());
         assert!(!state_path.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn hidden_state_never_changes_a_replaced_node() {
+    fn isolated_node_never_replaces_a_new_device_path() {
         let dir = test_dir("replaced-node");
         let device = dir.join("event7");
-        let replacement = dir.join("replacement");
+        let hidden = dir.join(".keyforge-event7");
         let state_path = dir.join("hidden.json");
         fs::write(&device, b"original").unwrap();
         fs::set_permissions(&device, fs::Permissions::from_mode(0o640)).unwrap();
-        let state = HiddenDeviceState::capture(&device).unwrap();
-        state.save(&state_path).unwrap();
+        isolate_test_node(&device, &hidden, &state_path);
 
-        fs::write(&replacement, b"replacement").unwrap();
-        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::rename(&replacement, &device).unwrap();
+        fs::write(&device, b"replacement").unwrap();
+        fs::set_permissions(&device, fs::Permissions::from_mode(0o600)).unwrap();
 
-        assert!(!Device::restore_hidden_state(&state_path).unwrap());
+        assert!(!Device::restore_hidden_state_with_validation(&state_path, false).unwrap());
+        assert_eq!(fs::read(&device).unwrap(), b"replacement");
         assert_eq!(fs::metadata(&device).unwrap().mode() & 0o7777, 0o600);
+        assert!(!hidden.exists());
+        assert!(!state_path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn disconnected_node_discards_the_private_link() {
+        let dir = test_dir("discard-link");
+        let device = dir.join("event7");
+        let hidden = dir.join(".keyforge-event7");
+        let state_path = dir.join("hidden.json");
+        fs::write(&device, b"device").unwrap();
+        let state = isolate_test_node(&device, &hidden, &state_path);
+
+        state.discard().unwrap();
+        fs::remove_file(&state_path).unwrap();
+        assert!(!device.exists());
+        assert!(!hidden.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migrates_permission_only_hidden_state() {
+        let dir = test_dir("legacy-permissions");
+        let device = dir.join("event7");
+        let state_path = dir.join("hidden.json");
+        fs::write(&device, b"device").unwrap();
+        fs::set_permissions(&device, fs::Permissions::from_mode(0o640)).unwrap();
+        let metadata = fs::metadata(&device).unwrap();
+        let legacy_state = serde_json::json!({
+            "path": device,
+            "mode": 0o640,
+            "dev": metadata.dev(),
+            "ino": metadata.ino(),
+            "rdev": metadata.rdev(),
+        });
+        fs::write(&state_path, serde_json::to_vec(&legacy_state).unwrap()).unwrap();
+        fs::set_permissions(&device, fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert!(Device::restore_hidden_state_with_validation(&state_path, false).unwrap());
+        assert_eq!(fs::metadata(&device).unwrap().mode() & 0o7777, 0o640);
         assert!(!state_path.exists());
         fs::remove_dir_all(dir).unwrap();
     }

@@ -445,16 +445,16 @@ onBeforeUnmount(() => {
           <div class="hide-visual" aria-hidden="true">
             <div class="device-node">event</div>
             <div class="hide-slash"></div>
-            <div class="mode-chip">000</div>
+            <div class="mode-chip">unlinked</div>
           </div>
           <p v-if="!runtime.deviceHideSupported" class="supporting-text warning-text">
             Available only when the module runs through KernelSU or Magisk.
           </p>
           <p v-else-if="selectedDetails" class="supporting-text">
-            The switch controls hiding for {{ selectedDetails.name }}. KeyForge keeps its root handle open while Android userspace access is removed.
+            The switch controls hiding for {{ selectedDetails.name }}. KeyForge moves its event node to a private link, so Android's EventHub unregisters the physical controller.
           </p>
           <p v-else-if="runtime.deviceHideEnabled" class="supporting-text">
-            Hiding remains enabled for the configured source. Reconnect it and scan again, or turn the switch off.
+            Hiding remains enabled for the configured source. Reconnect it and scan again, or turn the switch off to restore the node.
           </p>
           <p v-else class="supporting-text">
             Select the physical source device above, then enable this switch.

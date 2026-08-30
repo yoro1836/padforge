@@ -51,10 +51,10 @@ fn main() {
 
     if let Some(state_path) = restore_hidden_state {
         match Device::restore_hidden_state(&state_path) {
-            Ok(true) => println!("keyforge: physical device permissions restored"),
-            Ok(false) => println!("keyforge: no matching hidden device"),
+            Ok(true) => println!("keyforge: physical device node restored"),
+            Ok(false) => println!("keyforge: no live hidden device to restore"),
             Err(error) => {
-                eprintln!("keyforge: failed to restore physical device permissions: {error}");
+                eprintln!("keyforge: failed to restore physical device node: {error}");
                 std::process::exit(1);
             }
         }
@@ -63,10 +63,10 @@ fn main() {
 
     if let Some(state_path) = hidden_state_path.as_deref() {
         match Device::restore_hidden_state(state_path) {
-            Ok(true) => eprintln!("keyforge: restored stale physical device permissions"),
+            Ok(true) => eprintln!("keyforge: restored stale physical device node"),
             Ok(false) => {}
             Err(error) => {
-                eprintln!("keyforge: failed to restore stale physical device permissions: {error}");
+                eprintln!("keyforge: failed to restore stale physical device node: {error}");
                 std::process::exit(1);
             }
         }
@@ -350,30 +350,30 @@ fn main() {
     }
 }
 
-/// Find and grab the physical device, create its virtual mirror, then optionally
-/// remove access to the physical event node for Android userspace.
+/// Find and grab the physical device, create its virtual mirror, then remove
+/// the physical event node so Android's EventHub unregisters it.
 fn connect_device(dev: &mut Device, vid: u16, pid: u16, hide_device: bool) {
     loop {
         if let Some((fd, path)) = Device::find_device(vid, pid) {
             dev.fd = fd;
             dev.path = Some(path.clone());
             eprintln!(
-                "keyforge: controller detected at {} (vid={:04x} pid={:04x}), waiting 1s before creating virtual device",
+                "keyforge: controller detected at {} (vid={:04x} pid={:04x}), waiting 1s before activation",
                 path.display(),
                 vid,
                 pid
             );
             std::thread::sleep(Duration::from_millis(1000));
-            if dev.init_u(dev.fd, vid) {
-                if hide_device {
-                    if let Err(error) = dev.set_hidden(true) {
-                        eprintln!("keyforge: physical device hiding failed: {error}; retrying");
-                        dev.deinit();
-                        std::thread::sleep(Duration::from_millis(1000));
-                        continue;
-                    }
-                    eprintln!("keyforge: physical device hidden from Android");
+            if hide_device {
+                if let Err(error) = dev.set_hidden(true) {
+                    eprintln!("keyforge: physical device isolation failed: {error}; retrying");
+                    dev.deinit();
+                    std::thread::sleep(Duration::from_millis(1000));
+                    continue;
                 }
+                eprintln!("keyforge: physical device removed from Android EventHub");
+            }
+            if dev.init_u(dev.fd, vid) {
                 eprintln!("keyforge: virtual device created");
                 return;
             }
