@@ -18,7 +18,7 @@ direct access to `/dev/input`.
 - **Lua pipeline** — chain plugins that process stick, trigger, and button events
 - **Plugin API** — `pf.emit(type, code, value)`, `pf.drop()`, `pf.log()` for full control
 - **Device mirroring** — copies physical device capabilities (keys, axes, absinfo) to virtual device
-- **Physical-device hiding** — KernelSU/Magisk can unlink the selected event node so Android unregisters the physical controller
+- **Physical-device hiding** — KernelSU/Magisk can unlink the selected event node so Android unregisters the physical controller; AX Manager never exposes this control
 - **Vue WebUI** — offline Vue 3 interface with a Material 3 Expressive design
 - **Hot reload** — config changes detected within 500ms, no restart needed
 - **Per-plugin config** — settings saved to `/sdcard/.keyforge/configs/<id>.conf`
@@ -44,7 +44,9 @@ compatible Magisk module WebUI client; all configuration remains in the same UI.
 
 ## Physical-device hiding
 
-Use the WebUI for the complete flow:
+On KernelSU or Magisk, use the WebUI for the complete flow. The card is omitted
+entirely in AX Manager because its ADB-level plugin environment must not rename
+or remove `/dev/input` nodes.
 
 1. Scan and select the controller under **Source device**.
 2. Turn on **Hide physical device** for that selected controller.

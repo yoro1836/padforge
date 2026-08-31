@@ -49,10 +49,11 @@ jobs:
           cache: npm
           cache-dependency-path: webui/package-lock.json
 
-      - name: Build WebUI
+      - name: Test and build WebUI
         working-directory: webui
         run: |
           npm ci
+          npm test
           npm run build
 
       - name: Verify generated WebUI

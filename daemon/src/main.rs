@@ -21,6 +21,21 @@ struct ProcCtx<'a> {
     pending: &'a mut Vec<(Instant, EmitEvent)>,
 }
 
+fn runtime_dir() -> PathBuf {
+    for key in ["KEYFORGE_RUNTIME_DIR", "TMPDIR"] {
+        if let Some(dir) = env::var_os(key)
+            && !dir.is_empty()
+        {
+            return PathBuf::from(dir);
+        }
+    }
+    if cfg!(target_os = "android") {
+        PathBuf::from("/data/local/tmp")
+    } else {
+        env::temp_dir()
+    }
+}
+
 fn main() {
     let mut config_path = PathBuf::from("/sdcard/.keyforge/keyforge.conf");
     let mut allow_device_hide = false;
@@ -141,6 +156,9 @@ fn main() {
     }
     let mut dev = Device::new(hidden_state_path);
     let ev_size = std::mem::size_of::<InputEvent>();
+    let runtime_dir = runtime_dir();
+    let raw_file_l = runtime_dir.join(RAW_FILE_L);
+    let raw_file_r = runtime_dir.join(RAW_FILE_R);
     let mut pending_releases: Vec<(Instant, EmitEvent)> = Vec::new();
 
     // inotify for device hotplug only
@@ -385,8 +403,8 @@ fn main() {
                         }
                     }
                     EV_SYN if iev.code as u32 == SYN_REPORT => {
-                        let _ = fs::write(RAW_FILE_L, format!("{} {}", dev.lx, dev.ly));
-                        let _ = fs::write(RAW_FILE_R, format!("{} {}", dev.rx, dev.ry));
+                        let _ = fs::write(&raw_file_l, format!("{} {}", dev.lx, dev.ly));
+                        let _ = fs::write(&raw_file_r, format!("{} {}", dev.rx, dev.ry));
                         if dev.ld {
                             process_stick(
                                 &iev,

@@ -1,6 +1,10 @@
 import { exec as kernelSuExec, toast as kernelSuToast } from 'kernelsu'
 
-const MODULE_SCRIPT = `if [ -f /data/adb/modules/keyforge/keyforge.sh ]; then _kf=/data/adb/modules/keyforge/keyforge.sh; elif [ -f /data/user_de/0/com.android.shell/axeron/plugins/keyforge/keyforge.sh ]; then _kf=/data/user_de/0/com.android.shell/axeron/plugins/keyforge/keyforge.sh; else echo 'KeyForge module script not found' >&2; exit 127; fi; sh "$_kf"`
+const ROOT_MODULE_SCRIPT = '/data/adb/modules/keyforge/keyforge.sh'
+const AX_MODULE_SCRIPTS = [
+  '/data/user_de/0/com.android.shell/axeron/plugins/keyforge/keyforge.sh',
+  '/data/user_de/0/android/axeron/plugins/keyforge/keyforge.sh',
+]
 
 function normalizeResult(result) {
   if (typeof result === 'string') {
@@ -17,12 +21,24 @@ function normalizeResult(result) {
 }
 
 export function shellQuote(value) {
-  return `'${String(value).replace(/'/g, `'"'"'`)}'`
+  return `'${String(value).replace(/'/g, `'\\''`)}'`
 }
 
-export function hasRootBridge() {
+export function escapeAxManagerCommand(command) {
+  // AxManager currently transports commands by interpolating them into
+  // `sh -c "..."`. Escape the outer shell's metacharacters so quotes and
+  // expansions arrive unchanged at the inner shell.
+  return String(command).replace(/[\\"$`]/g, '\\$&')
+}
+
+export function isAxManagerBridge() {
+  return Boolean(globalThis.Axeron && typeof globalThis.Axeron.exec === 'function')
+}
+
+export function hasCommandBridge() {
   return Boolean(
-    (globalThis.kernelsu && typeof globalThis.kernelsu.exec === 'function') ||
+    isAxManagerBridge() ||
+      (globalThis.kernelsu && typeof globalThis.kernelsu.exec === 'function') ||
       (globalThis.ksu && typeof globalThis.ksu.exec === 'function'),
   )
 }
@@ -33,8 +49,15 @@ export async function execRoot(command) {
     raw = await globalThis.kernelsu.exec(command)
   } else if (globalThis.ksu && typeof globalThis.ksu.exec === 'function') {
     raw = await kernelSuExec(command)
+  } else if (isAxManagerBridge()) {
+    const response = globalThis.Axeron.exec(command, '{}')
+    try {
+      raw = JSON.parse(response)
+    } catch {
+      raw = response
+    }
   } else {
-    throw new Error('Root WebUI bridge unavailable. Open this page from AX Manager or KernelSU.')
+    throw new Error('WebUI command bridge unavailable. Open this page from AX Manager or KernelSU.')
   }
 
   const result = normalizeResult(raw)
@@ -44,9 +67,21 @@ export async function execRoot(command) {
   return result.stdout
 }
 
-export function runScript(...args) {
+export function buildScriptCommand(args, axManager = isAxManagerBridge()) {
   const suffix = args.length ? ` ${args.map(shellQuote).join(' ')}` : ''
-  return execRoot(`${MODULE_SCRIPT}${suffix}`)
+  const missing = `echo 'KeyForge module script not found' >&2; exit 127`
+
+  if (!axManager) {
+    return `if [ -f ${ROOT_MODULE_SCRIPT} ]; then sh ${ROOT_MODULE_SCRIPT}${suffix}; else ${missing}; fi`
+  }
+
+  const [shellScript, rootScript] = AX_MODULE_SCRIPTS
+  const command = `if [ -f ${shellScript} ]; then AXERON=true sh ${shellScript}${suffix}; elif [ -f ${rootScript} ]; then AXERON=true sh ${rootScript}${suffix}; else ${missing}; fi`
+  return escapeAxManagerCommand(command)
+}
+
+export function runScript(...args) {
+  return execRoot(buildScriptCommand(args))
 }
 
 export function nativeToast(message) {
@@ -55,6 +90,8 @@ export function nativeToast(message) {
       kernelSuToast(message)
     } else if (globalThis.kernelsu && typeof globalThis.kernelsu.toast === 'function') {
       globalThis.kernelsu.toast(message)
+    } else if (globalThis.Axeron && typeof globalThis.Axeron.toast === 'function') {
+      globalThis.Axeron.toast(message)
     }
   } catch {
     // The in-page snackbar remains the source of truth.

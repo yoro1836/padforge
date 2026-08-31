@@ -169,8 +169,8 @@ pub const O_WRONLY: i32 = 0o1;
 pub const O_NONBLOCK: i32 = 0o4000;
 pub const EAGAIN: i32 = 11;
 
-pub const RAW_FILE_L: &str = "/tmp/keyforge_raw_L";
-pub const RAW_FILE_R: &str = "/tmp/keyforge_raw_R";
+pub const RAW_FILE_L: &str = "keyforge_raw_L";
+pub const RAW_FILE_R: &str = "keyforge_raw_R";
 pub const PLUGIN_MANIFEST: &str = "/sdcard/.keyforge/manifest.json";
 
 // ---------------------------------------------------------------------------

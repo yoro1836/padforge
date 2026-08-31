@@ -7,6 +7,7 @@ CONF="$MODDIR/keyforge.conf"
 PIDFILE="$MODDIR/keyforge.pid"
 LOG="$MODDIR/keyforge.log"
 HIDDEN_STATE="$MODDIR/.hidden-device.json"
+RUNTIME_DIR_FILE="$MODDIR/.runtime-dir"
 DATA_DIR="/sdcard/.keyforge"
 MANIFEST="$DATA_DIR/manifest.json"
 PLUGIN_DIR="$DATA_DIR/plugins"
@@ -15,12 +16,39 @@ log() {
     echo "[keyforge] $(date '+%H:%M:%S') $*" >> "$LOG"
 }
 
+runtime_dir() {
+    _saved=""
+    [ -f "$RUNTIME_DIR_FILE" ] && read -r _saved < "$RUNTIME_DIR_FILE" 2>/dev/null
+    for _dir in "${KEYFORGE_RUNTIME_DIR:-}" "$_saved" "${TMPDIR:-}" /data/local/tmp /dev "$MODDIR"; do
+        [ -n "$_dir" ] && [ -d "$_dir" ] || continue
+        _probe="$_dir/.keyforge-tmp-$$"
+        if : > "$_probe" 2>/dev/null; then
+            rm -f "$_probe"
+            printf '%s' "$_dir"
+            return 0
+        fi
+    done
+    printf '%s' "$MODDIR"
+}
+
+is_axmanager_module() {
+    [ "${AXERON:-}" = "true" ] && return 0
+    case "$MODDIR" in
+        /data/user_de/0/com.android.shell/axeron/plugins/*|\
+        /data/user_de/0/android/axeron/plugins/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 detect_framework() {
-    if [ "${KSU:-}" = "true" ] || [ -x /data/adb/ksu/bin/busybox ]; then
+    if is_axmanager_module; then
+        echo "axmanager"
+    elif [ "${KSU:-}" = "true" ] || [ -x /data/adb/ksu/bin/busybox ]; then
         echo "kernelsu"
     elif [ -n "${MAGISK_VER_CODE:-}" ] || [ -x /data/adb/magisk/busybox ]; then
         echo "magisk"
-    elif [ -d /data/user_de/0/com.android.shell/axeron ]; then
+    elif [ -d /data/user_de/0/com.android.shell/axeron ] || \
+         [ -d /data/user_de/0/android/axeron ]; then
         echo "axmanager"
     else
         echo "unknown"
@@ -141,6 +169,10 @@ case "${1:-}" in
     start)
         ensure_conf
         mkdir -p "$MODDIR/plugins" "$PLUGIN_DIR" "$DATA_DIR/configs" 2>/dev/null
+        KEYFORGE_RUNTIME_DIR="$(runtime_dir)"
+        export KEYFORGE_RUNTIME_DIR
+        printf '%s\n' "$KEYFORGE_RUNTIME_DIR" > "$RUNTIME_DIR_FILE"
+        chmod 600 "$RUNTIME_DIR_FILE" 2>/dev/null || :
         if is_running; then
             echo "keyforge: already running (pid $(cat "$PIDFILE"))"
             exit 0
@@ -291,7 +323,7 @@ case "${1:-}" in
     devices)
         printf '{"devices":['
         _first=1
-        _tmp="/tmp/kf_devices.$$"
+        _tmp="$(runtime_dir)/kf_devices.$$"
         if [ -x /system/bin/getevent ]; then
             /system/bin/getevent -i 2>/dev/null > "$_tmp"
         else
@@ -427,13 +459,15 @@ case "${1:-}" in
     calibrate)
         case "${2:-}" in
             left)
-                [ -f /tmp/keyforge_raw_L ] && read -r cx cy < /tmp/keyforge_raw_L 2>/dev/null
+                _raw="$(runtime_dir)/keyforge_raw_L"
+                [ -f "$_raw" ] && read -r cx cy < "$_raw" 2>/dev/null
                 [ -n "${cx:-}" ] && config_set calib_lx "$cx" &&
                     config_set calib_ly "$cy" &&
                     echo "keyforge: calibrate left x=$cx y=$cy"
                 ;;
             right)
-                [ -f /tmp/keyforge_raw_R ] && read -r cx cy < /tmp/keyforge_raw_R 2>/dev/null
+                _raw="$(runtime_dir)/keyforge_raw_R"
+                [ -f "$_raw" ] && read -r cx cy < "$_raw" 2>/dev/null
                 [ -n "${cx:-}" ] && config_set calib_rx "$cx" &&
                     config_set calib_ry "$cy" &&
                     echo "keyforge: calibrate right x=$cx y=$cy"

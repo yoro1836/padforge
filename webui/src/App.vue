@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { hasRootBridge, nativeToast, runScript } from './bridge.js'
+import { hasCommandBridge, nativeToast, runScript } from './bridge.js'
 
 const KEY_PATTERN = /^[A-Za-z0-9._-]+$/
 
@@ -47,6 +47,7 @@ const selectedDetails = computed(() =>
 )
 
 const loadedPluginIds = computed(() => new Set(plugins.value.map((plugin) => plugin.id)))
+const showDeviceHide = computed(() => runtime.value.deviceHideSupported)
 
 function parseJson(raw, fallback) {
   try {
@@ -127,8 +128,8 @@ async function loadInstalledPlugins() {
 }
 
 async function refreshAll({ quiet = false } = {}) {
-  if (!hasRootBridge()) {
-    bridgeError.value = 'Root WebUI bridge unavailable. Open KeyForge from AX Manager or KernelSU.'
+  if (!hasCommandBridge()) {
+    bridgeError.value = 'WebUI command bridge unavailable. Open KeyForge from AX Manager or KernelSU.'
     initialLoading.value = false
     return
   }
@@ -399,7 +400,11 @@ onBeforeUnmount(() => {
     </section>
 
     <template v-else>
-      <section class="dashboard-grid" aria-label="KeyForge controls">
+      <section
+        class="dashboard-grid"
+        :class="{ 'single-column-lead': !showDeviceHide }"
+        aria-label="KeyForge controls"
+      >
         <article class="panel device-panel surface-container">
           <div class="panel-heading">
             <div>
@@ -435,7 +440,7 @@ onBeforeUnmount(() => {
           </p>
         </article>
 
-        <article class="panel hide-panel" :class="{ 'hide-active': runtime.deviceHideActive }">
+        <article v-if="showDeviceHide" class="panel hide-panel" :class="{ 'hide-active': runtime.deviceHideActive }">
           <div class="panel-heading">
             <div>
               <p class="eyebrow">ROOT PRIVACY</p>
@@ -467,10 +472,7 @@ onBeforeUnmount(() => {
             <div class="hide-slash"></div>
             <div class="mode-chip">unlinked</div>
           </div>
-          <p v-if="!runtime.deviceHideSupported" class="supporting-text warning-text">
-            Available only when the module runs through KernelSU or Magisk.
-          </p>
-          <p v-else-if="selectedDetails" class="supporting-text">
+          <p v-if="selectedDetails" class="supporting-text">
             The switch controls hiding for {{ selectedDetails.name }}. KeyForge moves its event node to a private link, so Android's EventHub unregisters the physical controller.
           </p>
           <p v-else-if="runtime.deviceHideEnabled" class="supporting-text">
